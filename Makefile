@@ -55,6 +55,19 @@ testbench_aes_pico.vvp: $(AES_TEST_FILES)
 	chmod -x $@
 #END   aes encryption
 
+#.................. >>> fpga_top_encryption testbench
+# Reuse AES files but drop the standalone AES testbench and extra picorv32 duplication
+FPGA_AES_SRCS = $(filter-out testbench_aes_pico.v picorv32.v,$(AES_TEST_FILES))
+FPGA_ENC_SRCS = fpga/tb_fpga_top_encryption.v fpga/fpga_top_encryption.v picorv32.v $(FPGA_AES_SRCS)
+
+test_fpga_top_encryption: fpga/tb_fpga_top_encryption.vvp
+	$(VVP) -N $< +vcd
+
+fpga/tb_fpga_top_encryption.vvp: $(FPGA_ENC_SRCS)
+	$(IVERILOG) -g2012 -o $@ $(subst C,-DCOMPRESSED_ISA,$(COMPRESSED_ISA)) $(FPGA_ENC_SRCS)
+	chmod -x $@
+
+
 #.................. >>>  aes Decryption
 
 
@@ -206,6 +219,7 @@ clean:
 		firmware/firmware.elf firmware/firmware.bin firmware/firmware.hex firmware/firmware.map \
 		testbench.vvp testbench_sp.vvp testbench_synth.vvp testbench_ez.vvp \
 		testbench_rvf.vvp testbench_wb.vvp testbench_aes_pico.vvp testbench_aes_decryption_pico.vvp \
+		fpga/tb_fpga_top_encryption.vvp tb_fpga_top_encryption.vcd \
 		testbench.vcd testbench.trace tb_picorv32_aes.vcd \
 		testbench_verilator testbench_verilator_dir
 

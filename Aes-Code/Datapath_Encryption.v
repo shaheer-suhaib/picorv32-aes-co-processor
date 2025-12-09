@@ -30,6 +30,7 @@ module Datapath_Encryption(
 	Sub_Bytes sb0(sub_out, round_out);
 	shift_rows sr0(row_out, reg_sub_out);
 	mix_cols mc(col_out, reg_row_out);
+	
 	assign key_r_out = key_r[count];
 	assign round_in = ((isRound0) ? plain_text : reg_col_out) ^ key_r_out;
 	assign Din = reg_row_out ^ key_r_out;

@@ -69,7 +69,7 @@ module fpga_top_encryption (
     
     // Load program from hex file at synthesis time
     initial begin
-        $readmemh("aes_encryption.hex", memory);
+        $readmemh("aes_encryption.data", memory);
     end
 
     // Memory read/write logic
