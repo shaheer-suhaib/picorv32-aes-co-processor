@@ -21,8 +21,8 @@ module Datapath_Encryption(
 
 	Register #(128) Reg_Dout(Dout, Din, en_Dout, clock, reset);
 	
-	//Counter
-	Counter #(4) up(count, 4'd0, 1'b0, inc_count, 1'b0, clock, reset);
+	//Counter - load=init to reset counter when starting new encryption
+	Counter #(4) up(count, 4'd0, init, inc_count, 1'b0, clock, reset);
 	assign count_lt_10 = count < 10;
 	
 	//AES blocks
