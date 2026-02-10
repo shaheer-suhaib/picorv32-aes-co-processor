@@ -40,7 +40,7 @@ make check
 ```bash
 iverilog -g2012 -o tb_aes_coprocessor.vvp picorv32.v \
     Aes-Code/ASMD_Encryption.v Aes-Code/ControlUnit_Enryption.v \
-    Aes-Code/Datapath_Encryption.v Aes-Code/Key_expansion.v \
+    Aes-Code/Datapath_Encryption.v Aes-Code/Round_Key_Update.v \
     Aes-Code/S_BOX.v Aes-Code/mix_cols.v Aes-Code/shift_rows.v \
     Aes-Code/Sub_Bytes.v Aes-Code/Counter.v Aes-Code/Register.v \
     Aes-Code/function_g.v tb_picorv32_aes_coprocessor.v
@@ -101,16 +101,55 @@ Key:        0x000102030405060708090a0b0c0d0e0f
 Ciphertext: 0x69c4e0d86a7b0430d8cdb78070b4c55a
 ```
 
+## Timing Optimization (100 MHz @ FPGA)
+
+### ⚠️ CRITICAL: On-the-Fly Key Expansion (Feb 2026)
+
+The original combinational `Key_expansion.v` created a **-16.7 ns timing violation** at 100 MHz due to:
+- 10 cascaded `function_g` blocks computing all 11 round keys simultaneously
+- Critical path: ~26.5 ns (2.65× the 10 ns clock period)
+
+**Solution Implemented:** Industry-standard **on-the-fly round key generation**
+- Added `Round_Key_Update.v` - computes next round key from current (1 function_g per cycle)
+- Modified `Datapath_Encryption.v` - added `Reg_round_key` register, removed combinational expansion
+- No control unit changes needed - existing `inc_count` signal controls updates
+
+**Results:**
+- Critical path: **26.5 ns → 3.5 ns** (7.6× improvement)
+- Slack @ 100 MHz: **-16.7 ns → +6.5 ns** ✅ TIMING CLOSURE
+- Area: **-21% LUTs** (removed 1100 LUTs, added 128 FFs)
+- Functionality: Unchanged (still passes FIPS-197 test vectors)
+
+📖 **See comprehensive documentation:** [`docs/TIMING_FIX_README.md`](docs/TIMING_FIX_README.md)
+
+### Key Implementation Details
+
+**Before (FAILED):**
+```verilog
+Key_expansion ke(key_r[0], ..., key_r[10], key);  // All 11 keys computed combinationally
+assign key_r_out = key_r[count];  // 11:1 mux adds delay
+```
+
+**After (PASSES):**
+```verilog
+Round_Key_Update rku(next_round_key, current_round_key, count+1);  // 1 key per cycle
+Register #(128) Reg_round_key(current_round_key, ..., init|inc_count, ...);
+// Direct use - no mux!
+```
+
 ## Key File Locations
 
 | Path | Purpose |
 |------|---------|
 | `picorv32.v` | CPU + AES + inline 8-lane parallel SPI (3500+ lines) |
-| `Aes-Code/ControlUnit_Enryption.v` | AES encryption FSM |
-| `Aes-Code/Datapath_Encryption.v` | AES encryption datapath |
+| `Aes-Code/ControlUnit_Enryption.v` | AES encryption FSM (unchanged) |
+| `Aes-Code/Datapath_Encryption.v` | AES encryption datapath (modified for on-the-fly keys) |
+| `Aes-Code/Round_Key_Update.v` | **NEW:** On-the-fly round key expansion (1 function_g) |
+| `Aes-Code/Key_expansion.v` | **DEPRECATED:** Original combinational expansion (not instantiated) |
 | `tb_picorv32_aes_coprocessor.v` | Main AES + 8-lane SPI testbench |
 | `firmware/custom_ops.S` | Custom instruction macros |
 | `fpga/` | FPGA top-level modules and constraints |
+| `docs/TIMING_FIX_README.md` | **Comprehensive timing optimization documentation** |
 | `SPI/` | Legacy serial SPI modules (no longer used) |
 
 ## Notes

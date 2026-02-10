@@ -22,7 +22,7 @@ module Datapath_Encryption(
 
 	// Round key register - stores current round key (key_r[count])
 	// Initialize with original key on init, update with next_round_key on inc_count
-	assign round_key_input = init ? key : next_round_key;
+	assign round_key_input = init ? key_in : next_round_key;
 	Register #(128) Reg_round_key(current_round_key, round_key_input, init | inc_count, clock, reset);
 
 	//Counter - load=init to reset counter when starting new encryption

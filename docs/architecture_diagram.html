@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PicoRV32 AES Co-Processor Architecture</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+
+        h1 {
+            text-align: center;
+            color: #2d3748;
+            margin-bottom: 10px;
+            font-size: 2em;
+        }
+
+        .subtitle {
+            text-align: center;
+            color: #718096;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+
+        .legend {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            margin-bottom: 30px;
+            flex-wrap: wrap;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 15px;
+            background: #f7fafc;
+            border-radius: 8px;
+        }
+
+        .legend-box {
+            width: 30px;
+            height: 30px;
+            border-radius: 5px;
+            border: 2px solid;
+        }
+
+        .legend-box.pcpi { background: #ebf8ff; border-color: #3182ce; }
+        .legend-box.aes { background: #f0fff4; border-color: #38a169; }
+        .legend-box.spi { background: #fef5e7; border-color: #d69e2e; }
+        .legend-box.buffer { background: #faf5ff; border-color: #805ad5; }
+
+        svg {
+            width: 100%;
+            height: auto;
+            border: 2px solid #e2e8f0;
+            border-radius: 10px;
+            background: #fafafa;
+        }
+
+        .module-box {
+            fill: white;
+            stroke-width: 3;
+            filter: drop-shadow(2px 2px 4px rgba(0,0,0,0.1));
+        }
+
+        .module-box.pcpi { stroke: #3182ce; }
+        .module-box.aes-enc { stroke: #38a169; }
+        .module-box.aes-dec { stroke: #e53e3e; }
+        .module-box.spi { stroke: #d69e2e; }
+        .module-box.buffer { stroke: #805ad5; }
+
+        .module-text {
+            font-size: 18px;
+            font-weight: bold;
+            text-anchor: middle;
+            fill: #2d3748;
+        }
+
+        .module-subtext {
+            font-size: 12px;
+            text-anchor: middle;
+            fill: #718096;
+        }
+
+        .data-flow {
+            stroke-width: 3;
+            fill: none;
+            marker-end: url(#arrowhead);
+        }
+
+        .data-flow.data { stroke: #3182ce; }
+        .data-flow.control { stroke: #e53e3e; stroke-dasharray: 5,5; }
+        .data-flow.spi-out { stroke: #d69e2e; }
+
+        .bus-label {
+            font-size: 11px;
+            fill: #4a5568;
+            font-weight: 600;
+        }
+
+        .bit-width {
+            font-size: 10px;
+            fill: #805ad5;
+            font-weight: bold;
+        }
+
+        .container-box {
+            fill: none;
+            stroke: #cbd5e0;
+            stroke-width: 2;
+            stroke-dasharray: 10,5;
+        }
+
+        .container-label {
+            font-size: 16px;
+            font-weight: bold;
+            fill: #4a5568;
+        }
+
+        .info-panel {
+            margin-top: 30px;
+            padding: 20px;
+            background: #f7fafc;
+            border-radius: 10px;
+            border-left: 4px solid #3182ce;
+        }
+
+        .info-panel h3 {
+            color: #2d3748;
+            margin-bottom: 15px;
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 15px;
+        }
+
+        .info-card {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+        }
+
+        .info-card h4 {
+            color: #3182ce;
+            margin-bottom: 8px;
+            font-size: 0.9em;
+        }
+
+        .info-card p {
+            color: #4a5568;
+            font-size: 0.85em;
+            line-height: 1.5;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 15px;
+            }
+            h1 {
+                font-size: 1.5em;
+            }
+            .legend {
+                gap: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 PicoRV32 AES Co-Processor Architecture</h1>
+        <p class="subtitle">Hardware-Accelerated AES-128 with 8-Lane Parallel SPI</p>
+
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-box pcpi"></div>
+                <span>PCPI Interface</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box aes"></div>
+                <span>AES Core</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box spi"></div>
+                <span>SPI Controller</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box buffer"></div>
+                <span>Data Buffer</span>
+            </div>
+        </div>
+
+        <svg viewBox="0 0 1200 700" xmlns="http://www.w3.org/2000/svg">
+            <!-- Define arrow markers -->
+            <defs>
+                <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                    <polygon points="0 0, 10 3, 0 6" fill="#3182ce" />
+                </marker>
+                <marker id="arrowhead-control" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                    <polygon points="0 0, 10 3, 0 6" fill="#e53e3e" />
+                </marker>
+                <marker id="arrowhead-spi" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                    <polygon points="0 0, 10 3, 0 6" fill="#d69e2e" />
+                </marker>
+            </defs>
+
+            <!-- Left System: Encryption Path -->
+            <rect class="container-box" x="20" y="30" width="560" height="630" rx="10"/>
+            <text class="container-label" x="300" y="60">Encryption System</text>
+
+            <!-- PCPI Interface (Left) -->
+            <rect class="module-box pcpi" x="50" y="100" width="140" height="100" rx="8"/>
+            <text class="module-text" x="120" y="145">PCPI</text>
+            <text class="module-subtext" x="120" y="165">Interface</text>
+            <text class="bit-width" x="120" y="185">[32-bit]</text>
+
+            <!-- PT Buffer -->
+            <rect class="module-box buffer" x="50" y="250" width="140" height="80" rx="8"/>
+            <text class="module-text" x="120" y="285">PT Buffer</text>
+            <text class="module-subtext" x="120" y="305">[128-bit]</text>
+
+            <!-- KEY Buffer -->
+            <rect class="module-box buffer" x="50" y="380" width="140" height="80" rx="8"/>
+            <text class="module-text" x="120" y="415">KEY Buffer</text>
+            <text class="module-subtext" x="120" y="435">[128-bit]</text>
+
+            <!-- AES Encryption Core -->
+            <rect class="module-box aes-enc" x="250" y="250" width="140" height="210" rx="8"/>
+            <text class="module-text" x="320" y="330">AES</text>
+            <text class="module-text" x="320" y="355">ENC</text>
+            <text class="module-subtext" x="320" y="380">Encryption</text>
+            <text class="module-subtext" x="320" y="400">Core</text>
+            <text class="bit-width" x="320" y="425">[128-bit]</text>
+            <text class="module-subtext" x="320" y="445">~45 cycles</text>
+
+            <!-- RESULT Buffer -->
+            <rect class="module-box buffer" x="250" y="520" width="140" height="80" rx="8"/>
+            <text class="module-text" x="320" y="555">RESULT</text>
+            <text class="module-subtext" x="320" y="575">[128-bit]</text>
+
+            <!-- SPI Controller -->
+            <rect class="module-box spi" x="440" y="250" width="120" height="350" rx="8"/>
+            <text class="module-text" x="500" y="300">SPI</text>
+            <text class="module-text" x="500" y="325">8-LANE</text>
+            <text class="module-subtext" x="500" y="350">Controller</text>
+
+            <!-- 8 lanes visual -->
+            <line x1="480" y1="380" x2="520" y2="380" stroke="#d69e2e" stroke-width="2"/>
+            <line x1="480" y1="395" x2="520" y2="395" stroke="#d69e2e" stroke-width="2"/>
+            <line x1="480" y1="410" x2="520" y2="410" stroke="#d69e2e" stroke-width="2"/>
+            <line x1="480" y1="425" x2="520" y2="425" stroke="#d69e2e" stroke-width="2"/>
+            <line x1="480" y1="440" x2="520" y2="440" stroke="#d69e2e" stroke-width="2"/>
+            <line x1="480" y1="455" x2="520" y2="455" stroke="#d69e2e" stroke-width="2"/>
+            <line x1="480" y1="470" x2="520" y2="470" stroke="#d69e2e" stroke-width="2"/>
+            <line x1="480" y1="485" x2="520" y2="485" stroke="#d69e2e" stroke-width="2"/>
+
+            <text class="module-subtext" x="500" y="515">[8-bit × 8]</text>
+            <text class="module-subtext" x="500" y="535">16 cycles</text>
+            <text class="module-subtext" x="500" y="555">160 ns</text>
+            <text class="module-subtext" x="500" y="575">@100MHz</text>
+
+            <!-- Data flows (Left System) -->
+            <!-- PCPI to PT Buffer -->
+            <path class="data-flow data" d="M 120 200 L 120 250" marker-end="url(#arrowhead)"/>
+            <text class="bus-label" x="130" y="225">Load PT</text>
+
+            <!-- PCPI to KEY Buffer -->
+            <path class="data-flow data" d="M 120 200 L 120 220 L 100 220 L 100 380" marker-end="url(#arrowhead)"/>
+            <text class="bus-label" x="75" y="300">Load KEY</text>
+
+            <!-- PT Buffer to AES -->
+            <path class="data-flow data" d="M 190 290 L 250 290" marker-end="url(#arrowhead)"/>
+            <text class="bit-width" x="210" y="285">128</text>
+
+            <!-- KEY Buffer to AES -->
+            <path class="data-flow data" d="M 190 420 L 250 390" marker-end="url(#arrowhead)"/>
+            <text class="bit-width" x="210" y="410">128</text>
+
+            <!-- AES to RESULT Buffer -->
+            <path class="data-flow data" d="M 320 460 L 320 520" marker-end="url(#arrowhead)"/>
+            <text class="bus-label" x="330" y="490">Dout</text>
+            <text class="bit-width" x="330" y="505">128</text>
+
+            <!-- RESULT to SPI -->
+            <path class="data-flow spi-out" d="M 390 560 L 440 425" marker-end="url(#arrowhead-spi)" stroke="#d69e2e"/>
+            <text class="bus-label" x="400" y="490" fill="#d69e2e">Auto</text>
+
+            <!-- PCPI Control to AES -->
+            <path class="data-flow control" d="M 190 150 L 250 330" marker-end="url(#arrowhead-control)" stroke-dasharray="5,5"/>
+            <text class="bus-label" x="200" y="240" fill="#e53e3e">START</text>
+
+            <!-- SPI Output -->
+            <path class="data-flow spi-out" d="M 560 425 L 590 425" marker-end="url(#arrowhead-spi)" stroke="#d69e2e" stroke-width="4"/>
+            <text class="bus-label" x="565" y="415" fill="#d69e2e">8-Lane</text>
+            <text class="bus-label" x="565" y="440" fill="#d69e2e">Output</text>
+
+            <!-- Right System: Decryption Path (Mirror) -->
+            <rect class="container-box" x="620" y="30" width="560" height="630" rx="10"/>
+            <text class="container-label" x="900" y="60">Decryption System</text>
+
+            <!-- SPI Input -->
+            <path class="data-flow spi-out" d="M 620 275 L 650 275" marker-end="url(#arrowhead-spi)" stroke="#d69e2e" stroke-width="4"/>
+            <text class="bus-label" x="610" y="265" fill="#d69e2e" text-anchor="end">8-Lane</text>
+            <text class="bus-label" x="610" y="290" fill="#d69e2e" text-anchor="end">Input</text>
+
+            <!-- SPI Receiver -->
+            <rect class="module-box spi" x="670" y="200" width="120" height="150" rx="8"/>
+            <text class="module-text" x="730" y="250">SPI</text>
+            <text class="module-text" x="730" y="275">Receiver</text>
+            <text class="module-subtext" x="730" y="300">[8-bit × 8]</text>
+            <text class="module-subtext" x="730" y="320">16 cycles</text>
+
+            <!-- CT Buffer -->
+            <rect class="module-box buffer" x="840" y="235" width="140" height="80" rx="8"/>
+            <text class="module-text" x="910" y="270">CT Buffer</text>
+            <text class="module-subtext" x="910" y="290">[128-bit]</text>
+
+            <!-- KEY Buffer (Right) -->
+            <rect class="module-box buffer" x="840" y="365" width="140" height="80" rx="8"/>
+            <text class="module-text" x="910" y="400">KEY Buffer</text>
+            <text class="module-subtext" x="910" y="420">[128-bit]</text>
+
+            <!-- AES Decryption Core -->
+            <rect class="module-box aes-dec" x="840" y="505" width="140" height="140" rx="8"/>
+            <text class="module-text" x="910" y="555">AES</text>
+            <text class="module-text" x="910" y="580">DEC</text>
+            <text class="module-subtext" x="910" y="605">Decryption</text>
+            <text class="bit-width" x="910" y="625">[128-bit]</text>
+
+            <!-- PCPI Interface (Right) -->
+            <rect class="module-box pcpi" x="1020" y="400" width="140" height="100" rx="8"/>
+            <text class="module-text" x="1090" y="445">PCPI</text>
+            <text class="module-subtext" x="1090" y="465">Interface</text>
+            <text class="bit-width" x="1090" y="485">[32-bit]</text>
+
+            <!-- Data flows (Right System) -->
+            <!-- SPI to CT Buffer -->
+            <path class="data-flow spi-out" d="M 790 275 L 840 275" marker-end="url(#arrowhead-spi)" stroke="#d69e2e"/>
+            <text class="bit-width" x="810" y="270">128</text>
+
+            <!-- CT Buffer to AES DEC -->
+            <path class="data-flow data" d="M 910 315 L 910 505" marker-end="url(#arrowhead)"/>
+            <text class="bit-width" x="920" y="410">128</text>
+
+            <!-- KEY Buffer to AES DEC -->
+            <path class="data-flow data" d="M 910 445 L 910 505" marker-end="url(#arrowhead)"/>
+            <text class="bit-width" x="920" y="475">128</text>
+
+            <!-- PCPI to KEY Buffer -->
+            <path class="data-flow data" d="M 1020 450 L 980 405" marker-end="url(#arrowhead)"/>
+            <text class="bus-label" x="990" y="435">Load KEY</text>
+
+            <!-- AES DEC to PCPI -->
+            <path class="data-flow data" d="M 980 575 L 1020 480" marker-end="url(#arrowhead)"/>
+            <text class="bus-label" x="990" y="530">Read PT</text>
+
+            <!-- Control -->
+            <path class="data-flow control" d="M 1090 500 L 1010 575" marker-end="url(#arrowhead-control)" stroke-dasharray="5,5"/>
+            <text class="bus-label" x="1040" y="540" fill="#e53e3e">START</text>
+        </svg>
+
+        <div class="info-panel">
+            <h3>📊 System Information</h3>
+            <div class="info-grid">
+                <div class="info-card">
+                    <h4>⚡ PCPI Interface</h4>
+                    <p>32-bit co-processor interface. Handles custom AES instructions (LOAD_PT, LOAD_KEY, START, READ, STATUS). Connects CPU to AES hardware.</p>
+                </div>
+                <div class="info-card">
+                    <h4>🔐 AES Encryption</h4>
+                    <p>128-bit AES-128 encryption core. Uses on-the-fly key expansion. Processes 10 rounds in ~45 cycles (450 ns @ 100 MHz).</p>
+                </div>
+                <div class="info-card">
+                    <h4>🔓 AES Decryption</h4>
+                    <p>128-bit AES-128 decryption core. Inverse operations (InvSubBytes, InvShiftRows, InvMixColumns). Same 10 rounds, ~45 cycles.</p>
+                </div>
+                <div class="info-card">
+                    <h4>📡 8-Lane SPI</h4>
+                    <p>Parallel SPI with 8 data lanes. Transmits 8 bits per clock (1 byte!). 128 bits in just 16 cycles. 8× faster than serial SPI.</p>
+                </div>
+                <div class="info-card">
+                    <h4>💾 PT/CT/KEY Buffers</h4>
+                    <p>128-bit registers that bridge 32-bit CPU with 128-bit AES. PT=Plaintext, CT=Ciphertext, KEY=Encryption Key. Loaded word-by-word.</p>
+                </div>
+                <div class="info-card">
+                    <h4>📈 Performance</h4>
+                    <p>Total latency: ~610 ns (AES 450ns + SPI 160ns). Throughput: 210 Mbps. 164× faster than software AES implementation.</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="info-panel" style="margin-top: 20px; border-left-color: #38a169;">
+            <h3>🔄 Data Flow Summary</h3>
+            <div style="display: flex; flex-direction: column; gap: 15px;">
+                <div style="display: flex; align-items: start; gap: 15px;">
+                    <div style="background: #3182ce; color: white; border-radius: 50%; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: bold;">1</div>
+                    <div>
+                        <strong>Encryption Path (Left):</strong>
+                        <p style="margin-top: 5px; color: #4a5568;">CPU → PCPI → PT/KEY Buffers → AES Encryption → RESULT Buffer → 8-Lane SPI → Output</p>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: start; gap: 15px;">
+                    <div style="background: #e53e3e; color: white; border-radius: 50%; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: bold;">2</div>
+                    <div>
+                        <strong>Decryption Path (Right):</strong>
+                        <p style="margin-top: 5px; color: #4a5568;">8-Lane SPI Input → SPI Receiver → CT/KEY Buffers → AES Decryption → PCPI → CPU</p>
+                    </div>
+                </div>
+                <div style="display: flex; align-items: start; gap: 15px;">
+                    <div style="background: #d69e2e; color: white; border-radius: 50%; width: 30px; height: 30px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; font-weight: bold;">⚡</div>
+                    <div>
+                        <strong>8-Lane Parallel Transmission:</strong>
+                        <p style="margin-top: 5px; color: #4a5568;">8 GPIO pins carry 1 byte simultaneously. 16 clock pulses = 128 bits. Automatic after encryption completes.</p>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

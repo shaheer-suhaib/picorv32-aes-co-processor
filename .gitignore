@@ -35,3 +35,7 @@
 /synth.log
 /synth.v
 .*.swp
+/Sha-Code
+.claude/
+/Makefile
+/CLAUDE.md

@@ -55,6 +55,24 @@ testbench_aes_pico.vvp: $(AES_TEST_FILES)
 	chmod -x $@
 #END   aes encryption
 
+#.................. >>> aes with BRAM memory
+test_aes_bram: program.hex testbench_aes_bram.vvp
+	$(VVP) -N testbench_aes_bram.vvp
+
+program.hex: generate_program_hex.py
+	$(PYTHON) generate_program_hex.py
+
+testbench_aes_bram.vvp: tb_picorv32_aes_bram.v bram_memory.v picorv32.v Aes-Code/*.v
+	$(IVERILOG) -g2012 -o $@ $(subst C,-DCOMPRESSED_ISA,$(COMPRESSED_ISA)) \
+		tb_picorv32_aes_bram.v bram_memory.v picorv32.v \
+		Aes-Code/ASMD_Encryption.v Aes-Code/ControlUnit_Enryption.v \
+		Aes-Code/Datapath_Encryption.v Aes-Code/Round_Key_Update.v \
+		Aes-Code/S_BOX.v Aes-Code/mix_cols.v Aes-Code/shift_rows.v \
+		Aes-Code/Sub_Bytes.v Aes-Code/Counter.v Aes-Code/Register.v \
+		Aes-Code/function_g.v
+	chmod -x $@
+#END   aes with BRAM memory
+
 #.................. >>>  aes Decryption
 
 
