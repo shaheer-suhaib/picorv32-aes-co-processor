@@ -16,7 +16,7 @@ module tb_picorv32_aes_bram;
     // Parameters
     //=========================================================
     parameter CLK_PERIOD = 10;          // 100 MHz clock
-    parameter TIMEOUT_CYCLES = 50000;   // Max cycles before timeout
+    parameter TIMEOUT_CYCLES = 100000;  // Max cycles before timeout
 
     //=========================================================
     // Clock and Reset
@@ -75,7 +75,7 @@ module tb_picorv32_aes_bram;
         .ENABLE_IRQ_QREGS(0),
         // **Enable AES encryption co-processor**
         .ENABLE_AES(1),
-        .ENABLE_AES_DEC(0)
+        .ENABLE_AES_DEC(1)
     ) cpu (
         .clk         (clk),
         .resetn      (resetn),
@@ -129,6 +129,12 @@ module tb_picorv32_aes_bram;
     reg        spi_transfer_complete = 0;
     reg [127:0] received_ciphertext;
 
+    // Decryption Result Tracking
+    reg [127:0] expected_plaintext = 128'h00112233445566778899aabbccddeeff;
+    reg [31:0]  match_result;
+    reg         match_result_valid = 0;
+    reg [31:0]  dec_word0, dec_word1, dec_word2, dec_word3;
+
     //=========================================================
     // Cycle Counter
     //=========================================================
@@ -178,6 +184,25 @@ module tb_picorv32_aes_bram;
     end
 
     //=========================================================
+    // Memory Write Monitor (Decryption Results)
+    //=========================================================
+    always @(posedge clk) begin
+        if (mem_valid && mem_ready && |mem_wstrb) begin
+            case (mem_addr)
+                32'h00000500: begin
+                    match_result <= mem_wdata;
+                    match_result_valid <= 1;
+                    $display("[Cycle %0d] Match result written: %0d", cycle_count, mem_wdata);
+                end
+                32'h00000600: dec_word0 <= mem_wdata;
+                32'h00000604: dec_word1 <= mem_wdata;
+                32'h00000608: dec_word2 <= mem_wdata;
+                32'h0000060C: dec_word3 <= mem_wdata;
+            endcase
+        end
+    end
+
+    //=========================================================
     // Trap Monitor
     //=========================================================
     always @(posedge clk) begin
@@ -196,15 +221,17 @@ module tb_picorv32_aes_bram;
     //=========================================================
     initial begin : main_test
         integer i;
+        reg [127:0] decrypted_plaintext;
 
         $display("================================================================");
-        $display("  PicoRV32 AES with BRAM Memory Test");
+        $display("  PicoRV32 AES Full Pipeline Test (Encrypt + Decrypt)");
         $display("================================================================");
         $display("");
         $display("Configuration:");
         $display("  - Memory: BRAM-based (synthesizable)");
         $display("  - Init File: program.hex");
         $display("  - Clock: %0d MHz", 1000/CLK_PERIOD);
+        $display("  - Pipeline: Encrypt -> SPI -> Decrypt -> Verify");
         $display("");
 
         // Initialize SPI capture
@@ -217,36 +244,65 @@ module tb_picorv32_aes_bram;
         $display("[Cycle 0] Reset released - CPU starting");
         $display("");
 
-        // Wait for SPI transfer completion
+        // Wait for full pipeline completion or timeout
         fork
-            begin : wait_spi
+            begin : wait_pipeline
+                // === Phase 1: Encryption + SPI ===
                 wait(spi_transfer_complete == 1);
+
+                repeat (10) @(posedge clk);
+
                 $display("");
                 $display("================================================================");
-                $display("  SPI Transfer Complete - Verifying Results");
+                $display("  SPI Transfer Complete - Verifying Encryption");
                 $display("================================================================");
-
-                // Give time for memory writes
-                repeat (200) @(posedge clk);
-
-                // Display results
                 $display("");
                 $display("Received Ciphertext: 0x%032x", received_ciphertext);
                 $display("Expected Ciphertext: 0x%032x", expected_ciphertext);
 
                 if (received_ciphertext == expected_ciphertext) begin
                     $display("");
-                    $display("================================================================");
-                    $display("  *** TEST PASSED *** ");
-                    $display("================================================================");
-                    $display("");
+                    $display("*** ENCRYPTION TEST PASSED ***");
                 end else begin
                     $display("");
-                    $display("================================================================");
-                    $display("  *** TEST FAILED ***");
-                    $display("================================================================");
-                    $display("");
+                    $display("*** ENCRYPTION TEST FAILED ***");
                 end
+
+                // === Phase 2: Decryption ===
+                wait(match_result_valid == 1);
+
+                repeat (10) @(posedge clk);
+
+                // Assemble decrypted plaintext from captured words
+                decrypted_plaintext = {dec_word3, dec_word2, dec_word1, dec_word0};
+
+                $display("");
+                $display("================================================================");
+                $display("  Decryption Complete - Verifying Results");
+                $display("================================================================");
+                $display("");
+                $display("Decrypted Plaintext: 0x%032x", decrypted_plaintext);
+                $display("Original Plaintext:  0x%032x", expected_plaintext);
+
+                if (match_result == 32'd1) begin
+                    $display("");
+                    $display("*** DECRYPTION TEST PASSED ***");
+                end else begin
+                    $display("");
+                    $display("*** DECRYPTION TEST FAILED ***");
+                    $display("  Match result: %0d (expected 1)", match_result);
+                end
+
+                // === Final Verdict ===
+                $display("");
+                $display("================================================================");
+                if (received_ciphertext == expected_ciphertext && match_result == 32'd1) begin
+                    $display("  *** FULL PIPELINE PASSED ***");
+                end else begin
+                    $display("  *** PIPELINE TEST FAILED ***");
+                end
+                $display("================================================================");
+                $display("");
 
                 #1000;
                 $finish;
@@ -259,6 +315,8 @@ module tb_picorv32_aes_bram;
                 $display("  *** TIMEOUT - Test did not complete ***");
                 $display("================================================================");
                 $display("  Cycles elapsed: %0d", TIMEOUT_CYCLES);
+                $display("  SPI complete: %0b", spi_transfer_complete);
+                $display("  Decrypt result valid: %0b", match_result_valid);
                 $display("");
                 $finish;
             end

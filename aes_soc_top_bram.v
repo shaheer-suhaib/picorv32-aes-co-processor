@@ -60,7 +60,7 @@ module aes_soc_top_bram (
         .ENABLE_IRQ_QREGS(0),
         // **Enable AES encryption co-processor**
         .ENABLE_AES(1),
-        .ENABLE_AES_DEC(0)
+        .ENABLE_AES_DEC(1)
     ) cpu (
         .clk         (clk),
         .resetn      (resetn),

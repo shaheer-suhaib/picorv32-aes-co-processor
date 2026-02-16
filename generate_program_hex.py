@@ -65,14 +65,45 @@ def aes_status(rd):
 def nop():
     return addi(0, 0, 0)
 
+def xor_inst(rd, rs1, rs2):
+    """XOR rd, rs1, rs2"""
+    return encode_r_type(0b0110011, 0b100, 0b0000000, rd, rs1, rs2)
+
+def or_inst(rd, rs1, rs2):
+    """OR rd, rs1, rs2"""
+    return encode_r_type(0b0110011, 0b110, 0b0000000, rd, rs1, rs2)
+
+# AES decryption custom instructions (opcode 0x0B, funct3=0x0)
+def aes_dec_load_ct(rs2, rs1):
+    """AES_DEC_LOAD_CT: Load ciphertext word for decryption"""
+    return encode_r_type(0b0001011, 0b000, 0b0101000, 0, rs1, rs2)
+
+def aes_dec_load_key(rs2, rs1):
+    """AES_DEC_LOAD_KEY: Load key word for decryption"""
+    return encode_r_type(0b0001011, 0b000, 0b0101001, 0, rs1, rs2)
+
+def aes_dec_start():
+    """AES_DEC_START: Start decryption"""
+    return encode_r_type(0b0001011, 0b000, 0b0101010, 0, 0, 0)
+
+def aes_dec_read(rd, rs1):
+    """AES_DEC_READ: Read decrypted plaintext word"""
+    return encode_r_type(0b0001011, 0b000, 0b0101011, rd, rs1, 0)
+
+def aes_dec_status(rd):
+    """AES_DEC_STATUS: Check decryption completion"""
+    return encode_r_type(0b0001011, 0b000, 0b0101100, rd, 0, 0)
+
 # FIPS-197 Test Vector
 PLAINTEXT  = 0x00112233445566778899AABBCCDDEEFF
 KEY        = 0x000102030405060708090A0B0C0D0E0F
 
-# Memory addresses
-PT_ADDR     = 0x100  # Plaintext data location (word 64-67)
-KEY_ADDR    = 0x200  # Key data location (word 128-131)
-RESULT_ADDR = 0x300  # Result storage (word 192-195)
+# Memory addresses (must not overlap with program code ~74 instructions = 0x128 bytes)
+PT_ADDR         = 0x200  # Plaintext data location (word 128-131)
+KEY_ADDR        = 0x300  # Key data location (word 192-195)
+RESULT_ADDR     = 0x400  # Encrypted result storage (word 256-259)
+MATCH_ADDR      = 0x500  # Decryption match flag: 1=match, 2=mismatch
+DEC_RESULT_ADDR = 0x600  # Decrypted plaintext storage (for debug)
 
 def generate_program():
     """Generate the complete test program"""
@@ -82,9 +113,9 @@ def generate_program():
     program.append(addi(1, 0, 1))           # x1 = 1
     program.append(addi(2, 0, 2))           # x2 = 2
     program.append(addi(3, 0, 3))           # x3 = 3
-    program.append(addi(6, 0, 0x100))       # x6 = PT_ADDR
-    program.append(addi(4, 0, 0x200))       # x4 = KEY_ADDR
-    program.append(addi(12, 0, 0x300))      # x12 = RESULT_ADDR
+    program.append(addi(6, 0, PT_ADDR))      # x6 = PT_ADDR (0x200)
+    program.append(addi(4, 0, KEY_ADDR))    # x4 = KEY_ADDR (0x300)
+    program.append(addi(12, 0, RESULT_ADDR))# x12 = RESULT_ADDR (0x400)
 
     # === Load Plaintext into AES ===
     for i in range(4):
@@ -109,9 +140,60 @@ def generate_program():
         program.append(aes_read(8+i, i))    # AES_READ x(8+i), idx=i
         program.append(sw(8+i, 12, i*4))    # sw x(8+i), offset(x12)
 
+    # ==========================================================
+    # === Decryption Pipeline ===
+    # ==========================================================
+
+    # Set up new base addresses
+    program.append(addi(13, 0, MATCH_ADDR))        # x13 = MATCH_ADDR (0x400)
+    program.append(addi(18, 0, DEC_RESULT_ADDR))   # x18 = DEC_RESULT_ADDR (0x500)
+
+    # Load ciphertext into decryption module (x8-x11 already have ciphertext)
+    for i in range(4):
+        program.append(aes_dec_load_ct(8+i, i))    # AES_DEC_LOAD_CT x(8+i), idx=i
+
+    # Re-load key from memory and load into decryption module
+    for i in range(4):
+        program.append(lw(5, 4, i*4))              # lw x5, offset(x4) (x4 = KEY_ADDR)
+        program.append(aes_dec_load_key(5, i))     # AES_DEC_LOAD_KEY idx=i
+
+    # Start decryption
+    program.append(aes_dec_start())
+
+    # Poll for decryption completion
+    program.append(aes_dec_status(7))               # AES_DEC_STATUS x7
+    program.append(beqz(7, -4))                     # beqz x7, poll_loop
+
+    # Read decrypted plaintext
+    for i in range(4):
+        program.append(aes_dec_read(14+i, i))       # AES_DEC_READ x(14+i), idx=i
+
+    # Store decrypted words to DEC_RESULT_ADDR
+    for i in range(4):
+        program.append(sw(14+i, 18, i*4))           # sw x(14+i), offset(x18)
+
+    # Re-load original plaintext for comparison
+    for i in range(4):
+        program.append(lw(19+i, 6, i*4))            # lw x(19+i), offset(x6) (x6 = PT_ADDR)
+
+    # Compare: XOR word-by-word and accumulate
+    program.append(xor_inst(23, 14, 19))            # x23 = x14 ^ x19
+    program.append(xor_inst(5, 15, 20))             # x5  = x15 ^ x20
+    program.append(or_inst(23, 23, 5))              # x23 |= x5
+    program.append(xor_inst(5, 16, 21))             # x5  = x16 ^ x21
+    program.append(or_inst(23, 23, 5))              # x23 |= x5
+    program.append(xor_inst(5, 17, 22))             # x5  = x17 ^ x22
+    program.append(or_inst(23, 23, 5))              # x23 |= x5
+    # x23 = 0 if all match, non-zero if mismatch
+
+    # Write match result: 1=match, 2=mismatch
+    program.append(addi(24, 0, 1))                  # x24 = 1 (match)
+    program.append(beqz(23, 8))                     # if x23==0, skip next instr (+8 bytes)
+    program.append(addi(24, 0, 2))                  # x24 = 2 (mismatch)
+    program.append(sw(24, 13, 0))                   # sw x24, 0(x13) -> MATCH_ADDR
+
     # === End program (infinite loop) ===
-    end_loop = len(program)
-    program.append(beqz(0, 0))              # beqz x0, 0 (infinite loop)
+    program.append(beqz(0, 0))                      # beqz x0, 0 (infinite loop)
 
     return program
 
@@ -119,7 +201,7 @@ def generate_data():
     """Generate data section (plaintext and key)"""
     data = {}
 
-    # Plaintext at address 0x100 (word 64-67)
+    # Plaintext at PT_ADDR (0x200 = word 128-131)
     pt_words = [
         (PLAINTEXT >>  0) & 0xFFFFFFFF,
         (PLAINTEXT >> 32) & 0xFFFFFFFF,
@@ -127,9 +209,9 @@ def generate_data():
         (PLAINTEXT >> 96) & 0xFFFFFFFF,
     ]
     for i, word in enumerate(pt_words):
-        data[0x40 + i] = word  # 0x100 >> 2 = 0x40
+        data[PT_ADDR // 4 + i] = word
 
-    # Key at address 0x200 (word 128-131)
+    # Key at KEY_ADDR (0x300 = word 192-195)
     key_words = [
         (KEY >>  0) & 0xFFFFFFFF,
         (KEY >> 32) & 0xFFFFFFFF,
@@ -137,7 +219,7 @@ def generate_data():
         (KEY >> 96) & 0xFFFFFFFF,
     ]
     for i, word in enumerate(key_words):
-        data[0x80 + i] = word  # 0x200 >> 2 = 0x80
+        data[KEY_ADDR // 4 + i] = word
 
     return data
 
@@ -167,10 +249,11 @@ def main():
     print(f"Generated {output_file}")
     print(f"   Memory size: {MEM_SIZE} words ({MEM_SIZE*4} bytes)")
     print(f"   Program size: {len(program)} instructions")
-    print(f"   Test Vector:")
+    print(f"   Test Vector (FIPS-197):")
     print(f"     Plaintext:  0x{PLAINTEXT:032x}")
     print(f"     Key:        0x{KEY:032x}")
-    print(f"     Expected:   0x69c4e0d86a7b0430d8cdb78070b4c55a")
+    print(f"     Expected CT: 0x69c4e0d86a7b0430d8cdb78070b4c55a")
+    print(f"   Pipeline: Encrypt -> SPI -> Decrypt -> Verify")
 
 if __name__ == "__main__":
     main()
