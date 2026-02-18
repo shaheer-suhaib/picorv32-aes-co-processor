@@ -78,6 +78,7 @@ module picorv32 #(
 	parameter [ 0:0] ENABLE_DIV = 0,
 	parameter [ 0:0] ENABLE_AES = 0,
 	parameter [ 0:0] ENABLE_AES_DEC = 0,
+	parameter [ 0:0] ENABLE_SHA256 = 0,
 	parameter [ 0:0] ENABLE_IRQ = 0,
 	parameter [ 0:0] ENABLE_IRQ_QREGS = 1,
 	parameter [ 0:0] ENABLE_IRQ_TIMER = 1,
@@ -174,7 +175,7 @@ module picorv32 #(
 	localparam integer regfile_size = (ENABLE_REGS_16_31 ? 32 : 16) + 4*ENABLE_IRQ*ENABLE_IRQ_QREGS;
 	localparam integer regindex_bits = (ENABLE_REGS_16_31 ? 5 : 4) + ENABLE_IRQ*ENABLE_IRQ_QREGS;
 
-	localparam WITH_PCPI = ENABLE_PCPI || ENABLE_MUL || ENABLE_FAST_MUL || ENABLE_DIV || ENABLE_AES || ENABLE_AES_DEC;
+	localparam WITH_PCPI = ENABLE_PCPI || ENABLE_MUL || ENABLE_FAST_MUL || ENABLE_DIV || ENABLE_AES || ENABLE_AES_DEC || ENABLE_SHA256;
 
 	localparam [35:0] TRACE_BRANCH = {4'b 0001, 32'b 0};
 	localparam [35:0] TRACE_ADDR   = {4'b 0010, 32'b 0};
@@ -282,6 +283,11 @@ module picorv32 #(
 	wire        pcpi_aesdec_wait;
 	wire        pcpi_aesdec_ready;
 
+	wire        pcpi_sha256_wr;
+	wire [31:0] pcpi_sha256_rd;
+	wire        pcpi_sha256_wait;
+	wire        pcpi_sha256_ready;
+
 	reg        pcpi_int_wr;
 	reg [31:0] pcpi_int_rd;
 	reg        pcpi_int_wait;
@@ -388,6 +394,26 @@ module picorv32 #(
 		assign pcpi_aesdec_ready = 0;
 	end endgenerate
 
+	generate if (ENABLE_SHA256) begin
+		pcpi_sha256 pcpi_sha256_inst (
+			.clk       (clk              ),
+			.resetn    (resetn           ),
+			.pcpi_valid(pcpi_valid       ),
+			.pcpi_insn (pcpi_insn        ),
+			.pcpi_rs1  (pcpi_rs1         ),
+			.pcpi_rs2  (pcpi_rs2         ),
+			.pcpi_wr   (pcpi_sha256_wr   ),
+			.pcpi_rd   (pcpi_sha256_rd   ),
+			.pcpi_wait (pcpi_sha256_wait ),
+			.pcpi_ready(pcpi_sha256_ready)
+		);
+	end else begin
+		assign pcpi_sha256_wr = 0;
+		assign pcpi_sha256_rd = 32'bx;
+		assign pcpi_sha256_wait = 0;
+		assign pcpi_sha256_ready = 0;
+	end endgenerate
+
 	always @* begin
 		pcpi_int_wr = 0;
 		pcpi_int_rd = 32'bx;
@@ -395,12 +421,14 @@ module picorv32 #(
 		                   (ENABLE_MUL || ENABLE_FAST_MUL) && pcpi_mul_wait,
 		                   ENABLE_DIV && pcpi_div_wait,
 		                   ENABLE_AES && pcpi_aes_wait,
-		                   ENABLE_AES_DEC && pcpi_aesdec_wait};
+		                   ENABLE_AES_DEC && pcpi_aesdec_wait,
+		                   ENABLE_SHA256 && pcpi_sha256_wait};
 		pcpi_int_ready = |{ENABLE_PCPI && pcpi_ready,
 		                   (ENABLE_MUL || ENABLE_FAST_MUL) && pcpi_mul_ready,
 		                   ENABLE_DIV && pcpi_div_ready,
 		                   ENABLE_AES && pcpi_aes_ready,
-		                   ENABLE_AES_DEC && pcpi_aesdec_ready};
+		                   ENABLE_AES_DEC && pcpi_aesdec_ready,
+		                   ENABLE_SHA256 && pcpi_sha256_ready};
 
 		(* parallel_case *)
 		case (1'b1)
@@ -423,6 +451,10 @@ module picorv32 #(
 			ENABLE_AES_DEC && pcpi_aesdec_ready: begin
 				pcpi_int_wr = pcpi_aesdec_wr;
 				pcpi_int_rd = pcpi_aesdec_rd;
+			end
+			ENABLE_SHA256 && pcpi_sha256_ready: begin
+				pcpi_int_wr = pcpi_sha256_wr;
+				pcpi_int_rd = pcpi_sha256_rd;
 			end
 		endcase
 	end
@@ -2613,6 +2645,7 @@ module picorv32_axi #(
 	parameter [ 0:0] ENABLE_FAST_MUL = 0,
 	parameter [ 0:0] ENABLE_DIV = 0,
 	parameter [ 0:0] ENABLE_AES = 0,
+	parameter [ 0:0] ENABLE_SHA256 = 0,
 	parameter [ 0:0] ENABLE_IRQ = 0,
 	parameter [ 0:0] ENABLE_IRQ_QREGS = 1,
 	parameter [ 0:0] ENABLE_IRQ_TIMER = 1,
@@ -2745,6 +2778,7 @@ module picorv32_axi #(
 		.ENABLE_FAST_MUL     (ENABLE_FAST_MUL     ),
 		.ENABLE_DIV          (ENABLE_DIV          ),
 		.ENABLE_AES          (ENABLE_AES          ),
+		.ENABLE_SHA256       (ENABLE_SHA256       ),
 		.ENABLE_IRQ          (ENABLE_IRQ          ),
 		.ENABLE_IRQ_QREGS    (ENABLE_IRQ_QREGS    ),
 		.ENABLE_IRQ_TIMER    (ENABLE_IRQ_TIMER    ),
@@ -2913,6 +2947,7 @@ module picorv32_wb #(
 	parameter [ 0:0] ENABLE_FAST_MUL = 0,
 	parameter [ 0:0] ENABLE_DIV = 0,
 	parameter [ 0:0] ENABLE_AES = 0,
+	parameter [ 0:0] ENABLE_SHA256 = 0,
 	parameter [ 0:0] ENABLE_IRQ = 0,
 	parameter [ 0:0] ENABLE_IRQ_QREGS = 1,
 	parameter [ 0:0] ENABLE_IRQ_TIMER = 1,
@@ -3011,6 +3046,7 @@ module picorv32_wb #(
 		.ENABLE_FAST_MUL     (ENABLE_FAST_MUL     ),
 		.ENABLE_DIV          (ENABLE_DIV          ),
 		.ENABLE_AES          (ENABLE_AES          ),
+		.ENABLE_SHA256       (ENABLE_SHA256       ),
 		.ENABLE_IRQ          (ENABLE_IRQ          ),
 		.ENABLE_IRQ_QREGS    (ENABLE_IRQ_QREGS    ),
 		.ENABLE_IRQ_TIMER    (ENABLE_IRQ_TIMER    ),
@@ -3147,7 +3183,7 @@ endmodule
  ***************************************************************/
 module pcpi_aes #(
 	parameter integer AES_SPI_CLKS_PER_HALF_BIT = 2,
-	parameter integer AES_SPI_NUM_BYTES = 16,
+	parameter integer AES_SPI_NUM_BYTES = 24,
 	parameter integer AES_SPI_CS_INACTIVE_CLKS = 1
 ) (
 	input clk, resetn,
@@ -3171,15 +3207,17 @@ module pcpi_aes #(
 	wire [6:0] funct7 = pcpi_insn[31:25];
 
 	wire is_custom = (opcode == 7'b0001011) && (funct3 == 3'b000);
-	wire instr_load_pt  = is_custom && (funct7 == 7'b0100000);
-	wire instr_load_key = is_custom && (funct7 == 7'b0100001);
-	wire instr_start    = is_custom && (funct7 == 7'b0100010);
-	wire instr_read     = is_custom && (funct7 == 7'b0100011);
-	wire instr_status   = is_custom && (funct7 == 7'b0100100);
-	wire instr_any = instr_load_pt | instr_load_key | instr_start | instr_read | instr_status;
+	wire instr_load_pt   = is_custom && (funct7 == 7'b0100000);
+	wire instr_load_key  = is_custom && (funct7 == 7'b0100001);
+	wire instr_start     = is_custom && (funct7 == 7'b0100010);
+	wire instr_read      = is_custom && (funct7 == 7'b0100011);
+	wire instr_status    = is_custom && (funct7 == 7'b0100100);
+	wire instr_read_hash = is_custom && (funct7 == 7'b0100101);
+	wire instr_any = instr_load_pt | instr_load_key | instr_start | instr_read | instr_status | instr_read_hash;
 
 	// Internal data registers
 	reg [127:0] PT, KEY, RESULT;
+	reg [255:0] DIGEST;  // SHA-256 hash of ciphertext
 
 	// AES control
 	reg aes_running;
@@ -3188,9 +3226,40 @@ module pcpi_aes #(
 	wire [127:0] Dout;
 	reg aes_local_reset;
 
+	// SHA-256 control (internal pipeline for automatic hashing)
+	reg sha_init;
+	reg sha_next;
+	wire sha_ready;
+	wire [255:0] sha_digest;
+	wire sha_digest_valid;
+
+	// SHA-256 message block: padded (CT || KEY) (256 bits -> 512-bit block)
+	// W[0..3] = CT[31:0], CT[63:32], CT[95:64], CT[127:96]
+	// W[4..7] = KEY[31:0], KEY[63:32], KEY[95:64], KEY[127:96]
+	// W[8] = 0x80000000, W[9..14] = 0, W[15] = 0x00000100 (256 bits)
+	wire [511:0] sha_block = {
+		RESULT[31:0], RESULT[63:32], RESULT[95:64], RESULT[127:96],
+		KEY[31:0],    KEY[63:32],    KEY[95:64],    KEY[127:96],
+		32'h80000000, 192'd0, 32'h00000100
+	};
+
+	// Internal SHA-256 core for automatic hashing of ciphertext
+	sha256_core sha_pipe_inst (
+		.clk          (clk),
+		.reset_n      (resetn),
+		.init         (sha_init),
+		.next         (sha_next),
+		.mode         (1'b1),         // SHA-256 mode
+		.block        (sha_block),
+		.ready        (sha_ready),
+		.digest       (sha_digest),
+		.digest_valid (sha_digest_valid)
+	);
+
 	// 8-lane parallel SPI control
-	reg [4:0] spi_byte_index;  // 0-15 (byte counter)
+	reg [4:0] spi_byte_index;  // 0-23 byte counter (16 CT + 8-byte auth tag)
 	reg spi_active;
+	wire [63:0] tag64 = DIGEST[255:192];
 
 	assign aes_spi_active = spi_active;
 
@@ -3205,18 +3274,22 @@ module pcpi_aes #(
 		.reset         (aes_local_reset)
 	);
 
-	// FSM states
-	localparam IDLE         = 3'd0;
-	localparam EXECUTE      = 3'd1;
-	localparam START_AES    = 3'd2;
-	localparam WAIT_AES     = 3'd3;
-	localparam SPI_CS_SETUP = 3'd4;  // CS setup time before first clock
-	localparam SPI_SEND     = 3'd5;
-	localparam SPI_CLK_LOW  = 3'd6;
-	localparam COMPLETE     = 3'd7;
+	// FSM states (4 bits for 12 states)
+	localparam IDLE         = 4'd0;
+	localparam EXECUTE      = 4'd1;
+	localparam START_AES    = 4'd2;
+	localparam WAIT_AES     = 4'd3;
+	localparam SHA_INIT     = 4'd4;   // Pulse SHA init
+	localparam SHA_NEXT     = 4'd5;   // Pulse SHA next
+	localparam SHA_DELAY    = 4'd6;   // Wait 1 cycle for core to start
+	localparam WAIT_SHA     = 4'd7;   // Wait for digest_valid
+	localparam SPI_CS_SETUP = 4'd8;   // CS setup time before first clock
+	localparam SPI_SEND     = 4'd9;   // Output byte + clock high
+	localparam SPI_CLK_LOW  = 4'd10;  // Clock low, advance index
+	localparam COMPLETE     = 4'd11;  // Signal PCPI done
 
-	reg [2:0] state;
-	reg [1:0] word_index;
+	reg [3:0] state;
+	reg [2:0] word_index;
 
 	always @(posedge clk) begin
 		if (!resetn) begin
@@ -3228,9 +3301,12 @@ module pcpi_aes #(
 			PT              <= 128'b0;
 			KEY             <= 128'b0;
 			RESULT          <= 128'b0;
+			DIGEST          <= 256'b0;
 			aes_running     <= 0;
 			aes_encrypt     <= 0;
 			aes_local_reset <= 0;
+			sha_init        <= 0;
+			sha_next        <= 0;
 			spi_byte_index  <= 0;
 			spi_active      <= 0;
 			aes_spi_data    <= 8'b0;
@@ -3242,12 +3318,14 @@ module pcpi_aes #(
 			pcpi_ready      <= 0;
 			aes_encrypt     <= 0;
 			aes_local_reset <= 0;
+			sha_init        <= 0;
+			sha_next        <= 0;
 
 			case (state)
 			IDLE: begin
 				pcpi_wait <= 0;
 				if (pcpi_valid && instr_any) begin
-					word_index <= pcpi_rs1[1:0];
+					word_index <= pcpi_rs1[2:0];
 					pcpi_wait  <= 1;
 					state      <= EXECUTE;
 				end
@@ -3255,7 +3333,7 @@ module pcpi_aes #(
 
 			EXECUTE: begin
 				if (instr_load_pt) begin
-					case (word_index)
+					case (word_index[1:0])
 						2'd0: PT[31:0]    <= pcpi_rs2;
 						2'd1: PT[63:32]   <= pcpi_rs2;
 						2'd2: PT[95:64]   <= pcpi_rs2;
@@ -3268,7 +3346,7 @@ module pcpi_aes #(
 					state      <= IDLE;
 				end
 				else if (instr_load_key) begin
-					case (word_index)
+					case (word_index[1:0])
 						2'd0: KEY[31:0]    <= pcpi_rs2;
 						2'd1: KEY[63:32]   <= pcpi_rs2;
 						2'd2: KEY[95:64]   <= pcpi_rs2;
@@ -3286,7 +3364,7 @@ module pcpi_aes #(
 					state           <= START_AES;
 				end
 				else if (instr_read) begin
-					case (word_index)
+					case (word_index[1:0])
 						2'd0: pcpi_rd <= RESULT[31:0];
 						2'd1: pcpi_rd <= RESULT[63:32];
 						2'd2: pcpi_rd <= RESULT[95:64];
@@ -3304,6 +3382,23 @@ module pcpi_aes #(
 					pcpi_wait  <= 0;
 					state      <= IDLE;
 				end
+				else if (instr_read_hash) begin
+					// Read SHA-256 hash word (rs1[2:0] = index 0-7)
+					case (word_index[2:0])
+						3'd0: pcpi_rd <= DIGEST[255:224];
+						3'd1: pcpi_rd <= DIGEST[223:192];
+						3'd2: pcpi_rd <= DIGEST[191:160];
+						3'd3: pcpi_rd <= DIGEST[159:128];
+						3'd4: pcpi_rd <= DIGEST[127:96];
+						3'd5: pcpi_rd <= DIGEST[95:64];
+						3'd6: pcpi_rd <= DIGEST[63:32];
+						3'd7: pcpi_rd <= DIGEST[31:0];
+					endcase
+					pcpi_wr    <= 1;
+					pcpi_ready <= 1;
+					pcpi_wait  <= 0;
+					state      <= IDLE;
+				end
 			end
 
 			START_AES: begin
@@ -3314,26 +3409,54 @@ module pcpi_aes #(
 
 			WAIT_AES: begin
 				if (aes_done) begin
-					RESULT         <= Dout;
-					spi_byte_index <= 0;
+					RESULT      <= Dout;
+					aes_running <= 0;
+					state       <= SHA_INIT;
+				end
+			end
+
+			// SHA-256 pipeline: automatically hash ciphertext after encryption
+			SHA_INIT: begin
+				sha_init <= 1;   // Pulse init (initializes H values in core)
+				state    <= SHA_NEXT;
+			end
+
+			SHA_NEXT: begin
+				// init reached core this cycle, now pulse next
+				sha_next <= 1;   // Pulse next (starts block processing)
+				state    <= SHA_DELAY;
+			end
+
+			SHA_DELAY: begin
+				// next reached core this cycle, wait for processing
+				state <= WAIT_SHA;
+			end
+
+			WAIT_SHA: begin
+				if (sha_digest_valid) begin
+					DIGEST         <= sha_digest;
+					spi_byte_index <= 5'd0;
 					spi_active     <= 1;          // Mark SPI as active
 					aes_spi_cs_n   <= 0;          // Assert chip select (active low)
-					aes_running    <= 0;
-					state          <= SPI_CS_SETUP;  // CS setup time
+					state          <= SPI_CS_SETUP;
 				end
 			end
 
 			SPI_CS_SETUP: begin
 				// CS has been low for one cycle, now output first byte with clock
-				aes_spi_data <= RESULT[7:0];  // First byte (LSB)
+				aes_spi_data <= RESULT[7:0];  // First byte (ciphertext LSB)
 				aes_spi_clk  <= 1;            // Strobe high
 				state        <= SPI_CLK_LOW;
 			end
 
 			SPI_SEND: begin
 				// 8-lane parallel SPI: output one byte per clock pulse
-				// Data is directly muxed from RESULT register
-				aes_spi_data <= RESULT[(spi_byte_index*8) +: 8];
+				// Bytes 0-15: ciphertext from RESULT (little-endian)
+				// Bytes 16-23: auth tag = DIGEST[255:192] (big-endian)
+				if (spi_byte_index < 5'd16)
+					aes_spi_data <= RESULT[(spi_byte_index*8) +: 8];
+				else
+					aes_spi_data <= tag64[((5'd23 - spi_byte_index)*8) +: 8];
 				aes_spi_clk  <= 1;  // Strobe high
 				state        <= SPI_CLK_LOW;
 			end
@@ -3341,11 +3464,11 @@ module pcpi_aes #(
 			SPI_CLK_LOW: begin
 				// Complete the clock cycle by bringing clock low
 				aes_spi_clk <= 0;
-				if (spi_byte_index < 15) begin
+				if (spi_byte_index < 5'd23) begin
 					spi_byte_index <= spi_byte_index + 1'b1;
 					state          <= SPI_SEND;
 				end else begin
-					// All 16 bytes sent
+					// All 24 bytes sent (16 CT + 8-byte auth tag)
 					spi_active   <= 0;
 					aes_spi_cs_n <= 1;  // Deassert chip select
 					state        <= COMPLETE;
@@ -3385,27 +3508,58 @@ module pcpi_aes_dec (
 	wire [2:0] funct3 = pcpi_insn[14:12];
 	wire [6:0] funct7 = pcpi_insn[31:25];
 
-	// Detect our custom instructions (opcode = custom-0 = 0001011, funct3 = 000)
-	wire is_custom        = (opcode == 7'b0001011) && (funct3 == 3'b000);
-	wire instr_load_ct    = is_custom && (funct7 == 7'b0101000);
-	wire instr_load_key   = is_custom && (funct7 == 7'b0101001);
-	wire instr_start      = is_custom && (funct7 == 7'b0101010);
-	wire instr_read       = is_custom && (funct7 == 7'b0101011);
-	wire instr_status     = is_custom && (funct7 == 7'b0101100);
-	wire instr_any        = instr_load_ct | instr_load_key | instr_start | instr_read | instr_status;
+	// Detect custom instructions (opcode = custom-0 = 0001011, funct3 = 000)
+	wire is_custom         = (opcode == 7'b0001011) && (funct3 == 3'b000);
+	wire instr_load_ct     = is_custom && (funct7 == 7'b0101000);
+	wire instr_load_key    = is_custom && (funct7 == 7'b0101001);
+	wire instr_start       = is_custom && (funct7 == 7'b0101010);
+	wire instr_read        = is_custom && (funct7 == 7'b0101011);
+	wire instr_status      = is_custom && (funct7 == 7'b0101100);
+	wire instr_load_tag    = is_custom && (funct7 == 7'b0101101);
+	wire instr_auth_status = is_custom && (funct7 == 7'b0101110);
+	wire instr_any         = instr_load_ct | instr_load_key | instr_start | instr_read |
+	                         instr_status | instr_load_tag | instr_auth_status;
 
 	// Internal data registers
-	reg [127:0] CT;      // Ciphertext input
-	reg [127:0] KEY;     // Key
-	reg [127:0] RESULT;  // Decrypted plaintext result
+	reg [127:0] CT;          // Ciphertext input
+	reg [127:0] KEY;         // Key
+	reg [127:0] RESULT;      // Decrypted plaintext result
+	reg [63:0]  RX_TAG;      // Received auth tag (leftmost 64 bits)
+	reg [63:0]  CALC_TAG;    // Calculated auth tag
+	reg [1:0]   auth_code;   // 0=busy, 1=pass, 2=fail
 
 	// AES control
 	reg dec_running;
-	reg dec_start_pulse;     // Trigger signal for AES decryption
+	reg dec_start_pulse;
+	reg dec_local_reset;
 	wire dec_done;
 	wire [127:0] Dout;
 
-	reg dec_local_reset;
+	// SHA control for CT||KEY authentication
+	reg sha_init;
+	reg sha_next;
+	wire sha_ready;
+	wire [255:0] sha_digest;
+	wire sha_digest_valid;
+
+	// SHA-256 message block: padded (CT || KEY) (256 bits -> 512-bit block)
+	wire [511:0] sha_block = {
+		CT[31:0], CT[63:32], CT[95:64], CT[127:96],
+		KEY[31:0], KEY[63:32], KEY[95:64], KEY[127:96],
+		32'h80000000, 192'd0, 32'h00000100
+	};
+
+	sha256_core sha_auth_inst (
+		.clk          (clk),
+		.reset_n      (resetn),
+		.init         (sha_init),
+		.next         (sha_next),
+		.mode         (1'b1),
+		.block        (sha_block),
+		.ready        (sha_ready),
+		.digest       (sha_digest),
+		.digest_valid (sha_digest_valid)
+	);
 
 	// Instantiate AES decryption core
 	ASMD_Decryption aes_dec_core (
@@ -3419,39 +3573,50 @@ module pcpi_aes_dec (
 	);
 
 	// FSM states
-	localparam IDLE       = 3'd0;
-	localparam EXECUTE    = 3'd1;
-	localparam START_DEC  = 3'd2;
-	localparam WAIT_DEC   = 3'd3;
+	localparam IDLE       = 4'd0;
+	localparam EXECUTE    = 4'd1;
+	localparam AUTH_INIT  = 4'd2;
+	localparam AUTH_NEXT  = 4'd3;
+	localparam AUTH_DELAY = 4'd4;
+	localparam WAIT_AUTH  = 4'd5;
+	localparam START_DEC  = 4'd6;
+	localparam WAIT_DEC   = 4'd7;
 
-	reg [2:0] state;
+	reg [3:0] state;
 	reg [1:0] word_index;
 
 	always @(posedge clk) begin
 		if (!resetn) begin
-			state         <= IDLE;
-			pcpi_ready    <= 0;
-			pcpi_wr       <= 0;
-			pcpi_wait     <= 0;
-			pcpi_rd       <= 0;
-			CT            <= 128'b0;
-			KEY           <= 128'b0;
-			RESULT        <= 128'b0;
-			dec_running   <= 0;
+			state           <= IDLE;
+			pcpi_ready      <= 0;
+			pcpi_wr         <= 0;
+			pcpi_wait       <= 0;
+			pcpi_rd         <= 0;
+			CT              <= 128'b0;
+			KEY             <= 128'b0;
+			RESULT          <= 128'b0;
+			RX_TAG          <= 64'b0;
+			CALC_TAG        <= 64'b0;
+			auth_code       <= 2'd1;
+			dec_running     <= 0;
 			dec_start_pulse <= 0;
 			dec_local_reset <= 0;
+			sha_init        <= 0;
+			sha_next        <= 0;
 		end else begin
 			// Default: clear single-cycle signals
 			pcpi_wr         <= 0;
 			pcpi_ready      <= 0;
 			dec_start_pulse <= 0;
 			dec_local_reset <= 0;
+			sha_init        <= 0;
+			sha_next        <= 0;
 
 			case (state)
 			IDLE: begin
 				pcpi_wait <= 0;
 				if (pcpi_valid && instr_any) begin
-					word_index <= pcpi_rs1[1:0];  // Word index from rs1
+					word_index <= pcpi_rs1[1:0];
 					pcpi_wait  <= 1;
 					state      <= EXECUTE;
 				end
@@ -3459,21 +3624,19 @@ module pcpi_aes_dec (
 
 			EXECUTE: begin
 				if (instr_load_ct) begin
-					// Load ciphertext word: CT[index] = rs2
 					case (word_index)
 						2'd0: CT[31:0]    <= pcpi_rs2;
 						2'd1: CT[63:32]   <= pcpi_rs2;
 						2'd2: CT[95:64]   <= pcpi_rs2;
 						2'd3: CT[127:96]  <= pcpi_rs2;
 					endcase
-					pcpi_rd    <= 32'd0;  // Return 0 (success)
+					pcpi_rd    <= 32'd0;
 					pcpi_wr    <= 1;
 					pcpi_ready <= 1;
 					pcpi_wait  <= 0;
 					state      <= IDLE;
 				end
 				else if (instr_load_key) begin
-					// Load key word: KEY[index] = rs2
 					case (word_index)
 						2'd0: KEY[31:0]    <= pcpi_rs2;
 						2'd1: KEY[63:32]   <= pcpi_rs2;
@@ -3486,15 +3649,23 @@ module pcpi_aes_dec (
 					pcpi_wait  <= 0;
 					state      <= IDLE;
 				end
+				else if (instr_load_tag) begin
+					case (word_index[0])
+						1'b0: RX_TAG[63:32] <= pcpi_rs2; // tag word 0 = digest[255:224]
+						1'b1: RX_TAG[31:0]  <= pcpi_rs2; // tag word 1 = digest[223:192]
+					endcase
+					pcpi_rd    <= 32'd0;
+					pcpi_wr    <= 1;
+					pcpi_ready <= 1;
+					pcpi_wait  <= 0;
+					state      <= IDLE;
+				end
 				else if (instr_start) begin
-					// Prepare AES decryption core: assert local reset for one full cycle,
-					// then kick decryption in START_DEC state.
-					dec_running    <= 1;
-					state          <= START_DEC;
-					dec_local_reset <= 1;
+					dec_running <= 1;
+					auth_code   <= 2'd0; // busy
+					state       <= AUTH_INIT;
 				end
 				else if (instr_read) begin
-					// Read result word
 					case (word_index)
 						2'd0: pcpi_rd <= RESULT[31:0];
 						2'd1: pcpi_rd <= RESULT[63:32];
@@ -3507,8 +3678,14 @@ module pcpi_aes_dec (
 					state      <= IDLE;
 				end
 				else if (instr_status) begin
-					// Return status: 1 = done/idle, 0 = busy
 					pcpi_rd    <= dec_running ? 32'd0 : 32'd1;
+					pcpi_wr    <= 1;
+					pcpi_ready <= 1;
+					pcpi_wait  <= 0;
+					state      <= IDLE;
+				end
+				else if (instr_auth_status) begin
+					pcpi_rd    <= dec_running ? 32'd0 : {30'd0, auth_code};
 					pcpi_wr    <= 1;
 					pcpi_ready <= 1;
 					pcpi_wait  <= 0;
@@ -3516,21 +3693,234 @@ module pcpi_aes_dec (
 				end
 			end
 
+			AUTH_INIT: begin
+				sha_init <= 1;
+				state    <= AUTH_NEXT;
+			end
+
+			AUTH_NEXT: begin
+				sha_next <= 1;
+				state    <= AUTH_DELAY;
+			end
+
+			AUTH_DELAY: begin
+				state <= WAIT_AUTH;
+			end
+
+			WAIT_AUTH: begin
+				if (sha_digest_valid) begin
+					CALC_TAG <= sha_digest[255:192];
+					if (sha_digest[255:192] == RX_TAG) begin
+						dec_local_reset <= 1;
+						state           <= START_DEC;
+					end else begin
+						dec_running <= 0;
+						auth_code   <= 2'd2; // fail
+						pcpi_rd     <= 32'd0;
+						pcpi_wr     <= 1;
+						pcpi_ready  <= 1;
+						pcpi_wait   <= 0;
+						state       <= IDLE;
+					end
+				end
+			end
+
 			START_DEC: begin
-				// Release reset and issue one-cycle start pulse after reset completed.
 				dec_start_pulse <= 1;
 				state           <= WAIT_DEC;
 			end
 
 			WAIT_DEC: begin
 				if (dec_done) begin
-					RESULT        <= Dout;      // Capture result
-					dec_running   <= 0;
-					pcpi_rd       <= 32'd0;     // Return 0 (success)
-					pcpi_wr       <= 1;
-					pcpi_ready    <= 1;
-					pcpi_wait     <= 0;
-					state         <= IDLE;
+					RESULT      <= Dout;
+					dec_running <= 0;
+					auth_code   <= 2'd1; // pass
+					pcpi_rd     <= 32'd0;
+					pcpi_wr     <= 1;
+					pcpi_ready  <= 1;
+					pcpi_wait   <= 0;
+					state       <= IDLE;
+				end
+			end
+
+			default: state <= IDLE;
+			endcase
+		end
+	end
+endmodule
+
+
+/***************************************************************
+ * pcpi_sha256 - SHA-256 Hash Co-Processor via PCPI
+ *
+ * Custom instructions (opcode=0x0B, funct3=0x0):
+ *   SHA_LOAD_MSG  funct7=0110000  Load message block word
+ *   SHA_START     funct7=0110001  Start SHA-256 hash
+ *   SHA_READ      funct7=0110010  Read digest word
+ *   SHA_STATUS    funct7=0110011  Check status
+ ***************************************************************/
+
+`default_nettype wire
+
+module pcpi_sha256 (
+	input clk, resetn,
+	input             pcpi_valid,
+	input      [31:0] pcpi_insn,
+	input      [31:0] pcpi_rs1,
+	input      [31:0] pcpi_rs2,
+	output reg        pcpi_wr,
+	output reg [31:0] pcpi_rd,
+	output reg        pcpi_wait,
+	output reg        pcpi_ready
+);
+	// Instruction decode
+	wire [6:0] opcode = pcpi_insn[6:0];
+	wire [2:0] funct3 = pcpi_insn[14:12];
+	wire [6:0] funct7 = pcpi_insn[31:25];
+
+	wire is_custom       = (opcode == 7'b0001011) && (funct3 == 3'b000);
+	wire instr_load_msg  = is_custom && (funct7 == 7'b0110000);
+	wire instr_start     = is_custom && (funct7 == 7'b0110001);
+	wire instr_read      = is_custom && (funct7 == 7'b0110010);
+	wire instr_status    = is_custom && (funct7 == 7'b0110011);
+	wire instr_any       = instr_load_msg | instr_start | instr_read | instr_status;
+
+	// Message block storage (16 x 32-bit words = 512 bits)
+	reg [31:0] block_reg [0:15];
+
+	// Digest register (captured from core on completion)
+	reg [255:0] DIGEST;
+
+	// SHA control
+	reg sha_running;
+	reg sha_init;
+	reg sha_next;
+
+	// Core interface - block_reg[0] maps to block[511:480] (MSB first)
+	wire [511:0] core_block = {
+		block_reg[ 0], block_reg[ 1], block_reg[ 2], block_reg[ 3],
+		block_reg[ 4], block_reg[ 5], block_reg[ 6], block_reg[ 7],
+		block_reg[ 8], block_reg[ 9], block_reg[10], block_reg[11],
+		block_reg[12], block_reg[13], block_reg[14], block_reg[15]
+	};
+
+	wire        core_ready;
+	wire [255:0] core_digest;
+	wire        core_digest_valid;
+
+	sha256_core sha_core_inst (
+		.clk          (clk),
+		.reset_n      (resetn),
+		.init         (sha_init),
+		.next         (sha_next),
+		.mode         (1'b1),         // 1 = SHA-256 mode (not SHA-224)
+		.block        (core_block),
+		.ready        (core_ready),
+		.digest       (core_digest),
+		.digest_valid (core_digest_valid)
+	);
+
+	// FSM states
+	localparam IDLE      = 3'd0;
+	localparam EXECUTE   = 3'd1;
+	localparam INIT_SHA  = 3'd2;
+	localparam START_SHA = 3'd3;
+	localparam WAIT_SHA  = 3'd4;
+
+	reg [2:0] state;
+	reg [3:0] word_index;
+
+	integer i;
+
+	always @(posedge clk) begin
+		if (!resetn) begin
+			state       <= IDLE;
+			pcpi_ready  <= 0;
+			pcpi_wr     <= 0;
+			pcpi_wait   <= 0;
+			pcpi_rd     <= 0;
+			DIGEST      <= 256'b0;
+			sha_running <= 0;
+			sha_init    <= 0;
+			sha_next    <= 0;
+			for (i = 0; i < 16; i = i + 1)
+				block_reg[i] <= 32'b0;
+		end else begin
+			// Clear single-cycle signals
+			pcpi_wr    <= 0;
+			pcpi_ready <= 0;
+			sha_init   <= 0;
+			sha_next   <= 0;
+
+			case (state)
+			IDLE: begin
+				pcpi_wait <= 0;
+				if (pcpi_valid && instr_any) begin
+					word_index <= pcpi_rs1[3:0];
+					pcpi_wait  <= 1;
+					state      <= EXECUTE;
+				end
+			end
+
+			EXECUTE: begin
+				if (instr_load_msg) begin
+					block_reg[word_index] <= pcpi_rs2;
+					pcpi_rd    <= 32'd0;
+					pcpi_wr    <= 1;
+					pcpi_ready <= 1;
+					pcpi_wait  <= 0;
+					state      <= IDLE;
+				end
+				else if (instr_start) begin
+					sha_running <= 1;
+					sha_init    <= 1;   // Pulse init (sets first_block in core)
+					state       <= INIT_SHA;
+				end
+				else if (instr_read) begin
+					case (word_index[2:0])
+						3'd0: pcpi_rd <= DIGEST[255:224];
+						3'd1: pcpi_rd <= DIGEST[223:192];
+						3'd2: pcpi_rd <= DIGEST[191:160];
+						3'd3: pcpi_rd <= DIGEST[159:128];
+						3'd4: pcpi_rd <= DIGEST[127:96];
+						3'd5: pcpi_rd <= DIGEST[95:64];
+						3'd6: pcpi_rd <= DIGEST[63:32];
+						3'd7: pcpi_rd <= DIGEST[31:0];
+					endcase
+					pcpi_wr    <= 1;
+					pcpi_ready <= 1;
+					pcpi_wait  <= 0;
+					state      <= IDLE;
+				end
+				else if (instr_status) begin
+					pcpi_rd    <= sha_running ? 32'd0 : 32'd1;
+					pcpi_wr    <= 1;
+					pcpi_ready <= 1;
+					pcpi_wait  <= 0;
+					state      <= IDLE;
+				end
+			end
+
+			INIT_SHA: begin
+				// init was pulsed previous cycle, now pulse next to start processing
+				sha_next <= 1;
+				state    <= START_SHA;
+			end
+
+			START_SHA: begin
+				// next was pulsed previous cycle, now wait for completion
+				state <= WAIT_SHA;
+			end
+
+			WAIT_SHA: begin
+				if (core_digest_valid) begin
+					DIGEST      <= core_digest;
+					sha_running <= 0;
+					pcpi_rd     <= 32'd0;
+					pcpi_wr     <= 1;
+					pcpi_ready  <= 1;
+					pcpi_wait   <= 0;
+					state       <= IDLE;
 				end
 			end
 

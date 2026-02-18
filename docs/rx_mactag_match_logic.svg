@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1300" viewBox="0 0 2200 1300">
+  <defs>
+    <marker id="arr" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#1f2937"/>
+    </marker>
+    <style>
+      .t0 { font: 700 34px Arial, sans-serif; fill: #0f172a; }
+      .t1 { font: 700 22px Arial, sans-serif; fill: #0f172a; }
+      .tx { font: 500 16px Arial, sans-serif; fill: #111827; }
+      .sm { font: 500 14px Arial, sans-serif; fill: #374151; }
+      .bx { fill: #f8fafc; stroke: #1f2937; stroke-width: 2; rx: 10; ry: 10; }
+      .sb { fill: #e0f2fe; stroke: #0369a1; stroke-width: 1.6; rx: 8; ry: 8; }
+      .ok { fill: #ecfdf5; stroke: #166534; stroke-width: 1.6; rx: 8; ry: 8; }
+      .bad { fill: #fef2f2; stroke: #991b1b; stroke-width: 1.6; rx: 8; ry: 8; }
+      .nt { fill: #eff6ff; stroke: #1d4ed8; stroke-width: 1.4; rx: 8; ry: 8; }
+      .ln { stroke: #1f2937; stroke-width: 2.2; fill: none; marker-end: url(#arr); }
+      .sl { stroke: #475569; stroke-width: 1.8; fill: none; marker-end: url(#arr); }
+    </style>
+  </defs>
+
+  <text x="40" y="55" class="t0">Receiver Side MACTAG Match Logic (Device B)</text>
+  <text x="40" y="86" class="sm">Reference mapping for your current pipeline: SPI RX -> tag check on SHA256(CT||KEY) -> decrypt only if tag matches.</text>
+
+  <!-- Left input path -->
+  <rect x="40" y="130" width="420" height="220" class="bx"/>
+  <text x="60" y="168" class="t1">1) SPI Receive Path</text>
+  <text x="60" y="198" class="tx">8-lane SPI Slave (`spi_slave_8lane`)</text>
+  <text x="60" y="223" class="sm">inputs: `spi_clk_in`, `spi_data_in[7:0]`, `spi_cs_n_in`</text>
+  <text x="60" y="248" class="sm">outputs: `rx_data[191:0]`, `rx_valid`</text>
+  <text x="60" y="273" class="sm">packet format: bytes[0..15]=CT, bytes[16..23]=TAG64</text>
+  <text x="60" y="298" class="sm">split signals: `rx_ct[127:0]`, `rx_tag[63:0]`</text>
+
+  <rect x="520" y="150" width="460" height="180" class="bx"/>
+  <text x="540" y="185" class="t1">2) CPU / MMIO Load Stage</text>
+  <text x="540" y="212" class="sm">CPU reads RX buffer and loads co-processor regs:</text>
+  <text x="540" y="236" class="tx">`AES_DEC_LOAD_CT`   -> CT words</text>
+  <text x="540" y="260" class="tx">`AES_DEC_LOAD_KEY`  -> KEY words</text>
+  <text x="540" y="284" class="tx">`AES_DEC_LOAD_TAG`  -> RX_TAG words</text>
+  <text x="540" y="308" class="tx">`AES_DEC_START`     -> start auth+decrypt FSM</text>
+
+  <line x1="460" y1="240" x2="520" y2="240" class="ln"/>
+  <text x="470" y="226" class="sm">`rx_ct`,`rx_tag`,`rx_valid`</text>
+
+  <!-- Core auth/decrypt block -->
+  <rect x="1040" y="110" width="1120" height="740" class="bx"/>
+  <text x="1060" y="148" class="t1">3) `pcpi_aes_dec` Internal Auth + Decrypt Datapath</text>
+
+  <rect x="1080" y="180" width="300" height="120" class="sb"/>
+  <text x="1100" y="214" class="tx">CT/KEY Register Bank</text>
+  <text x="1100" y="238" class="sm">`CT[127:0]`, `KEY[127:0]`</text>
+  <text x="1100" y="262" class="sm">loaded via custom instructions</text>
+
+  <rect x="1410" y="180" width="300" height="120" class="sb"/>
+  <text x="1430" y="214" class="tx">TAG Register Bank</text>
+  <text x="1430" y="238" class="sm">`RX_TAG[63:0]`</text>
+  <text x="1430" y="262" class="sm">from `AES_DEC_LOAD_TAG`</text>
+
+  <rect x="1080" y="340" width="630" height="160" class="sb"/>
+  <text x="1100" y="374" class="tx">SHA Block Builder</text>
+  <text x="1100" y="398" class="sm">`sha_block = {CT[31:0],CT[63:32],CT[95:64],CT[127:96],`</text>
+  <text x="1100" y="422" class="sm">`             KEY[31:0],KEY[63:32],KEY[95:64],KEY[127:96],`</text>
+  <text x="1100" y="446" class="sm">`             32'h80000000, 192'd0, 32'h00000100}`</text>
+  <text x="1100" y="470" class="sm">message = (CT||KEY), length=256 bits</text>
+
+  <rect x="1080" y="530" width="300" height="140" class="sb"/>
+  <text x="1100" y="564" class="tx">`sha256_core`</text>
+  <text x="1100" y="588" class="sm">controls: `sha_init`, `sha_next`</text>
+  <text x="1100" y="612" class="sm">outputs: `sha_digest[255:0]`,</text>
+  <text x="1100" y="636" class="sm">`sha_digest_valid`</text>
+
+  <rect x="1410" y="530" width="300" height="140" class="sb"/>
+  <text x="1430" y="564" class="tx">Tag Extract</text>
+  <text x="1430" y="588" class="sm">`calc_tag[63:0] = sha_digest[255:192]`</text>
+  <text x="1430" y="612" class="sm">leftmost 64 bits</text>
+  <text x="1430" y="636" class="sm">same format as TX tag</text>
+
+  <rect x="1740" y="530" width="380" height="170" class="sb"/>
+  <text x="1760" y="564" class="tx">MACTAG Match Comparator</text>
+  <text x="1760" y="590" class="sm">`tag_eq = (calc_tag == RX_TAG)`</text>
+  <text x="1760" y="616" class="sm">`auth_code = 2'b01` if match</text>
+  <text x="1760" y="642" class="sm">`auth_code = 2'b10` if mismatch</text>
+  <text x="1760" y="668" class="sm">`AES_DEC_AUTH_STATUS` returns auth_code</text>
+
+  <rect x="1740" y="220" width="380" height="250" class="sb"/>
+  <text x="1760" y="254" class="tx">Auth/Decrypt FSM</text>
+  <text x="1760" y="278" class="sm">`AUTH_INIT -> AUTH_NEXT -> WAIT_AUTH`</text>
+  <text x="1760" y="302" class="sm">if `tag_eq=1`: `START_DEC -> WAIT_DEC`</text>
+  <text x="1760" y="326" class="sm">if `tag_eq=0`: fail path, no decrypt</text>
+  <text x="1760" y="350" class="sm">status out:</text>
+  <text x="1760" y="374" class="sm">`AES_DEC_STATUS`     (busy/done)</text>
+  <text x="1760" y="398" class="sm">`AES_DEC_AUTH_STATUS`(pass/fail)</text>
+  <text x="1760" y="422" class="sm">gate signal: `dec_enable = tag_eq`</text>
+
+  <rect x="1080" y="710" width="630" height="120" class="ok"/>
+  <text x="1100" y="744" class="tx">Decrypt Core (ASMD_Decryption)</text>
+  <text x="1100" y="768" class="sm">runs only when `dec_enable=1`</text>
+  <text x="1100" y="792" class="sm">inputs: `CT`,`KEY`; output: `RESULT[127:0]`</text>
+  <text x="1100" y="816" class="sm">CPU reads with `AES_DEC_READ`</text>
+
+  <!-- Connections -->
+  <line x1="980" y1="240" x2="1080" y2="240" class="ln"/>
+  <text x="990" y="228" class="sm">CT/KEY/TAG load instructions</text>
+
+  <line x1="1230" y1="300" x2="1230" y2="340" class="ln"/>
+  <line x1="1560" y1="300" x2="1560" y2="340" class="ln"/>
+  <text x="1580" y="332" class="sm">`CT`,`KEY`,`RX_TAG`</text>
+
+  <line x1="1230" y1="500" x2="1230" y2="530" class="ln"/>
+  <line x1="1380" y1="600" x2="1410" y2="600" class="ln"/>
+  <line x1="1710" y1="600" x2="1740" y2="600" class="ln"/>
+  <text x="1720" y="586" class="sm">`calc_tag`,`RX_TAG`</text>
+
+  <line x1="1930" y1="530" x2="1930" y2="470" class="sl"/>
+  <text x="1940" y="510" class="sm">`tag_eq`,`auth_code`</text>
+
+  <line x1="1740" y1="730" x2="1710" y2="770" class="ln"/>
+  <text x="1730" y="760" class="sm">`dec_enable`</text>
+
+  <!-- Outputs -->
+  <rect x="40" y="420" width="940" height="430" class="bx"/>
+  <text x="60" y="458" class="t1">4) Output Actions (what to wire after MACTAG block)</text>
+
+  <rect x="70" y="490" width="430" height="140" class="ok"/>
+  <text x="90" y="526" class="tx">When `tag_eq=1` (MATCH)</text>
+  <text x="90" y="552" class="sm">`store_plaintext_en = dec_done & tag_eq`</text>
+  <text x="90" y="576" class="sm">write RESULT words to `DEC_RESULT_ADDR`</text>
+  <text x="90" y="600" class="sm">write `MATCH_ADDR = 32'd1`</text>
+
+  <rect x="530" y="490" width="430" height="140" class="bad"/>
+  <text x="550" y="526" class="tx">When `tag_eq=0` (MISMATCH)</text>
+  <text x="550" y="552" class="sm">`store_plaintext_en = 0` (block write)</text>
+  <text x="550" y="576" class="sm">do NOT push decrypt output to buffer</text>
+  <text x="550" y="600" class="sm">write `MATCH_ADDR = 32'd2`</text>
+
+  <rect x="70" y="660" width="890" height="160" class="nt"/>
+  <text x="90" y="694" class="tx">Recommended signal list for your MACTAG block symbol (in diagram):</text>
+  <text x="90" y="720" class="sm">Inputs: `rx_tag[63:0]`, `ct_data[127:0]`, `key_data[127:0]`, `sha_digest_valid`, `sha_digest[255:0]`, `start_auth`</text>
+  <text x="90" y="746" class="sm">Outputs: `tag_eq`, `auth_code[1:0]`, `auth_done`, `dec_enable`, `store_plaintext_en`, `match_flag[31:0]`</text>
+  <text x="90" y="772" class="sm">Equation core: `calc_tag = sha_digest[255:192]`; `tag_eq = (calc_tag == rx_tag)`</text>
+  <text x="90" y="798" class="sm">Status coding: `auth_code=2'b01` pass, `2'b10` fail, `2'b00` busy</text>
+
+  <line x1="1710" y1="770" x2="980" y2="560" class="sl"/>
+  <text x="1240" y="640" class="sm">`dec_done`,`tag_eq`,`auth_code`</text>
+</svg>

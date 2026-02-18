@@ -85,7 +85,7 @@ module tb_soc_image_transfer;
     // Device 2: SPI Slave + AES Decrypt (Receiver)
     //=========================================================
     // SPI Slave signals
-    wire [127:0] rx_block_data;
+    wire [191:0] rx_block_data;
     wire         rx_block_valid;
 
     // AES Decryption signals
@@ -253,7 +253,7 @@ module tb_soc_image_transfer;
                 RX_IDLE: begin
                     if (rx_block_valid) begin
                         // Received a block via SPI (rx_valid pulses for 1 cycle)
-                        dec_ciphertext <= rx_block_data;
+                        dec_ciphertext <= rx_block_data[127:0];
                         blocks_received <= blocks_received + 1;
                         rx_state <= RX_DECRYPT_START;
                     end

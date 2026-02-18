@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="2200" height="1400" viewBox="0 0 2200 1400">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="8" refX="9" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L10,4 L0,8 Z" fill="#1f2937"/>
+    </marker>
+    <style>
+      .title { font: 700 32px Arial, sans-serif; fill: #111827; }
+      .subtitle { font: 600 20px Arial, sans-serif; fill: #0f172a; }
+      .label { font: 500 16px Arial, sans-serif; fill: #111827; }
+      .small { font: 500 14px Arial, sans-serif; fill: #1f2937; }
+      .tiny { font: 500 13px Arial, sans-serif; fill: #374151; }
+      .box { fill: #f8fafc; stroke: #1f2937; stroke-width: 2; rx: 10; ry: 10; }
+      .subbox { fill: #eef2ff; stroke: #334155; stroke-width: 1.6; rx: 8; ry: 8; }
+      .bus { stroke: #1f2937; stroke-width: 2.3; fill: none; marker-end: url(#arrow); }
+      .soft { stroke: #475569; stroke-width: 1.8; fill: none; marker-end: url(#arrow); }
+      .note { fill: #ecfeff; stroke: #0e7490; stroke-width: 1.6; rx: 8; ry: 8; }
+      .fix { fill: #f0fdf4; stroke: #166534; stroke-width: 1.6; rx: 8; ry: 8; }
+      .section { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 1.2; rx: 14; ry: 14; }
+    </style>
+  </defs>
+
+  <text x="40" y="50" class="title">PicoRV32 AES + SHA256 Secure Pipeline (Current Fixed Dataflow)</text>
+  <text x="40" y="82" class="small">Clock domain: sys_clk 100 MHz. Signal names follow RTL ports and key internal nets in picorv32.v.</text>
+
+  <!-- TX section -->
+  <rect x="30" y="100" width="2140" height="520" class="section"/>
+  <text x="50" y="130" class="subtitle">A) Transmit Path: Encrypt -&gt; SHA256(CT||KEY) -&gt; SPI (CT + TAG64)</text>
+
+  <rect x="70" y="170" width="290" height="180" class="box"/>
+  <text x="90" y="205" class="label">BRAM Memory</text>
+  <text x="90" y="230" class="tiny">program.hex + data</text>
+  <text x="90" y="255" class="tiny">PT @ 0x300</text>
+  <text x="90" y="278" class="tiny">KEY @ 0x310</text>
+  <text x="90" y="301" class="tiny">RESULT @ 0x320</text>
+  <text x="90" y="324" class="tiny">MATCH @ 0x330</text>
+
+  <rect x="430" y="150" width="360" height="230" class="box"/>
+  <text x="450" y="185" class="label">PicoRV32 CPU</text>
+  <text x="450" y="210" class="tiny">Issues PCPI custom instructions</text>
+  <text x="450" y="234" class="tiny">AES_LOAD_PT / AES_LOAD_KEY / AES_START</text>
+  <text x="450" y="258" class="tiny">AES_READ / AES_READ_HASH</text>
+  <text x="450" y="282" class="tiny">AES_STATUS polling</text>
+
+  <rect x="860" y="140" width="500" height="320" class="box"/>
+  <text x="880" y="175" class="label">pcpi_aes (in picorv32.v)</text>
+  <text x="880" y="200" class="tiny">PT[127:0], KEY[127:0], RESULT[127:0], DIGEST[255:0]</text>
+  <text x="880" y="223" class="tiny">sha_block = {CT words, KEY words, 0x80000000, zeros, 0x00000100}</text>
+
+  <rect x="890" y="245" width="210" height="90" class="subbox"/>
+  <text x="905" y="275" class="small">ASMD_Encryption</text>
+  <text x="905" y="297" class="tiny">plain_text_in=PT</text>
+  <text x="905" y="317" class="tiny">key_in=KEY, Dout=RESULT</text>
+
+  <rect x="1120" y="245" width="220" height="90" class="subbox"/>
+  <text x="1135" y="275" class="small">sha256_core (sha_pipe_inst)</text>
+  <text x="1135" y="297" class="tiny">init/next, digest_valid</text>
+  <text x="1135" y="317" class="tiny">DIGEST = SHA256(CT||KEY)</text>
+
+  <rect x="890" y="350" width="450" height="90" class="subbox"/>
+  <text x="905" y="380" class="small">SPI packetizer FSM</text>
+  <text x="905" y="403" class="tiny">Bytes 0..15: RESULT[(i*8)+:8]  (ciphertext little-endian)</text>
+  <text x="905" y="425" class="tiny">Bytes 16..23: tag64 = DIGEST[255:192] (big-endian)</text>
+
+  <rect x="1460" y="170" width="330" height="230" class="box"/>
+  <text x="1480" y="205" class="label">SPI TX Pins (SoC output)</text>
+  <text x="1480" y="232" class="tiny">aes_spi_data[7:0]</text>
+  <text x="1480" y="255" class="tiny">aes_spi_clk</text>
+  <text x="1480" y="278" class="tiny">aes_spi_cs_n</text>
+  <text x="1480" y="301" class="tiny">aes_spi_active</text>
+  <text x="1480" y="330" class="tiny">Packet size = 24 bytes</text>
+
+  <line x1="360" y1="245" x2="430" y2="245" class="bus"/>
+  <text x="370" y="235" class="tiny">mem_valid/mem_addr/mem_wdata/mem_rdata</text>
+
+  <line x1="790" y1="235" x2="860" y2="235" class="bus"/>
+  <text x="705" y="222" class="tiny">pcpi_valid, pcpi_insn, pcpi_rs1, pcpi_rs2</text>
+
+  <line x1="860" y1="270" x2="790" y2="270" class="soft"/>
+  <text x="640" y="286" class="tiny">pcpi_ready, pcpi_wr, pcpi_rd, pcpi_wait</text>
+
+  <line x1="1100" y1="292" x2="1120" y2="292" class="bus"/>
+  <text x="1015" y="286" class="tiny">RESULT</text>
+
+  <line x1="1360" y1="290" x2="1460" y2="290" class="bus"/>
+  <text x="1370" y="280" class="tiny">aes_spi_* outputs</text>
+
+  <rect x="1830" y="190" width="310" height="180" class="note"/>
+  <text x="1850" y="220" class="small">TX payload format on wire</text>
+  <text x="1850" y="246" class="tiny">[0..15]  Ciphertext CT[127:0]</text>
+  <text x="1850" y="269" class="tiny">[16..23] Auth tag = SHA256(CT||KEY)[255:192]</text>
+  <text x="1850" y="292" class="tiny">Tag width: 64 bits</text>
+  <text x="1850" y="315" class="tiny">Digest full width: 256 bits</text>
+  <text x="1850" y="338" class="tiny">No extra 32-byte digest on SPI</text>
+
+  <!-- RX section -->
+  <rect x="30" y="650" width="2140" height="600" class="section"/>
+  <text x="50" y="680" class="subtitle">B) Receive + Verify + Decrypt Path: SPI RX -&gt; Tag check -&gt; Decrypt -&gt; Store results</text>
+
+  <rect x="70" y="730" width="290" height="180" class="box"/>
+  <text x="90" y="765" class="label">External SPI Source</text>
+  <text x="90" y="790" class="tiny">spi_clk_in</text>
+  <text x="90" y="813" class="tiny">spi_data_in[7:0]</text>
+  <text x="90" y="836" class="tiny">spi_cs_n_in</text>
+  <text x="90" y="860" class="tiny">Sends CT[16B] + TAG[8B]</text>
+
+  <rect x="430" y="720" width="340" height="210" class="box"/>
+  <text x="450" y="755" class="label">spi_slave_8lane</text>
+  <text x="450" y="780" class="tiny">RX_NUM_BYTES = 24</text>
+  <text x="450" y="804" class="tiny">rx_data[191:0], rx_valid, irq_rx</text>
+  <text x="450" y="828" class="tiny">Byte sample on rising spi_clk</text>
+  <text x="450" y="852" class="tiny">Little-endian shift-in storage</text>
+
+  <rect x="840" y="720" width="360" height="240" class="box"/>
+  <text x="860" y="755" class="label">spi_rx_buffer (MMIO)</text>
+  <text x="860" y="780" class="tiny">Captures rx_data on spi_rx_valid</text>
+  <text x="860" y="804" class="tiny">rx_data_buffer[127:0] = CT</text>
+  <text x="860" y="828" class="tiny">rx_tag_buffer[63:0]  = TAG</text>
+  <text x="860" y="852" class="tiny">MMIO: 0x3000_0004..0x10 CT words</text>
+  <text x="860" y="876" class="tiny">MMIO: 0x3000_001C..0x20 TAG words</text>
+  <text x="860" y="900" class="tiny">status + irq enable + clear</text>
+
+  <rect x="1260" y="700" width="360" height="280" class="box"/>
+  <text x="1280" y="735" class="label">PicoRV32 CPU (RX flow)</text>
+  <text x="1280" y="760" class="tiny">Reads CT/TAG from rx buffer MMIO</text>
+  <text x="1280" y="784" class="tiny">Loads KEY from BRAM</text>
+  <text x="1280" y="808" class="tiny">Calls AES_DEC_LOAD_CT / LOAD_KEY</text>
+  <text x="1280" y="832" class="tiny">Calls AES_DEC_LOAD_TAG / AES_DEC_START</text>
+  <text x="1280" y="856" class="tiny">Polls AES_DEC_STATUS and AUTH_STATUS</text>
+  <text x="1280" y="880" class="tiny">On pass: read plaintext words and store</text>
+
+  <rect x="1660" y="690" width="470" height="340" class="box"/>
+  <text x="1680" y="725" class="label">pcpi_aes_dec (in picorv32.v)</text>
+  <text x="1680" y="750" class="tiny">CT[127:0], KEY[127:0], RX_TAG[63:0], RESULT[127:0]</text>
+
+  <rect x="1685" y="780" width="210" height="95" class="subbox"/>
+  <text x="1700" y="810" class="small">sha256_core (sha_auth_inst)</text>
+  <text x="1700" y="832" class="tiny">Digest = SHA256(CT||KEY)</text>
+  <text x="1700" y="854" class="tiny">calc_tag = digest[255:192]</text>
+
+  <rect x="1910" y="780" width="200" height="95" class="subbox"/>
+  <text x="1925" y="810" class="small">Tag Compare</text>
+  <text x="1925" y="832" class="tiny">calc_tag == RX_TAG</text>
+  <text x="1925" y="854" class="tiny">auth_code: 1 pass, 2 fail</text>
+
+  <rect x="1685" y="900" width="425" height="105" class="subbox"/>
+  <text x="1700" y="930" class="small">ASMD_Decryption (gated by auth pass)</text>
+  <text x="1700" y="952" class="tiny">start only after successful tag check</text>
+  <text x="1700" y="974" class="tiny">on fail: skip decrypt, return auth_code=2</text>
+
+  <rect x="1260" y="1020" width="360" height="170" class="box"/>
+  <text x="1280" y="1055" class="label">Result Writes to BRAM</text>
+  <text x="1280" y="1080" class="tiny">DEC_RESULT_ADDR 0x340..0x34C (plaintext)</text>
+  <text x="1280" y="1104" class="tiny">MATCH_ADDR      0x330 (1 pass / 2 fail)</text>
+  <text x="1280" y="1128" class="tiny">SHA_MATCH_ADDR  0x460 (software SHA check)</text>
+
+  <rect x="1660" y="1050" width="470" height="170" class="box"/>
+  <text x="1680" y="1085" class="label">pcpi_sha256 (software verification path)</text>
+  <text x="1680" y="1110" class="tiny">CPU also computes SHA256(CT||KEY) via SHA custom instructions</text>
+  <text x="1680" y="1134" class="tiny">Stores digest H[0..7] @ 0x440..0x45C and compares expected H[0]</text>
+  <text x="1680" y="1158" class="tiny">Used by testbench end-to-end validation</text>
+
+  <line x1="360" y1="810" x2="430" y2="810" class="bus"/>
+  <text x="228" y="798" class="tiny">spi_clk_in, spi_data_in[7:0], spi_cs_n_in</text>
+
+  <line x1="770" y1="820" x2="840" y2="820" class="bus"/>
+  <text x="640" y="808" class="tiny">rx_data[191:0], rx_valid</text>
+
+  <line x1="1200" y1="835" x2="1260" y2="835" class="bus"/>
+  <text x="1030" y="823" class="tiny">MMIO reads: CT words + TAG words + status</text>
+
+  <line x1="1620" y1="840" x2="1660" y2="840" class="bus"/>
+  <text x="1470" y="826" class="tiny">pcpi_* + AES_DEC funct7 ops</text>
+
+  <line x1="1660" y1="965" x2="1620" y2="965" class="soft"/>
+  <text x="1450" y="982" class="tiny">pcpi_rd plaintext words / auth status</text>
+
+  <line x1="1440" y1="980" x2="1440" y2="1020" class="bus"/>
+  <text x="1460" y="1010" class="tiny">mem_wdata / mem_addr writes</text>
+
+  <line x1="1620" y1="1120" x2="1660" y2="1120" class="bus"/>
+  <text x="1450" y="1108" class="tiny">SHA custom ops</text>
+
+  <rect x="70" y="1260" width="2060" height="110" class="fix"/>
+  <text x="90" y="1290" class="small">Fixed items reflected in this current pipeline:</text>
+  <text x="90" y="1315" class="tiny">1) TX SHA input fixed to (CT||KEY), not CT-only. 2) SPI payload fixed to 24 bytes (16 CT + 8 TAG64).</text>
+  <text x="90" y="1338" class="tiny">3) RX auth added in pcpi_aes_dec using SHA256(CT||KEY) before decrypt. 4) Tag word order fixed when loading RX_TAG.</text>
+</svg>

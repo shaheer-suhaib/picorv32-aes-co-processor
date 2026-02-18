@@ -1,14 +1,16 @@
 /*
  * 8-Lane Parallel SPI Slave Receiver
  *
- * Receives 128-bit data over 8 parallel data lines.
+ * Receives packetized data over 8 parallel data lines.
  * - Samples data on rising edge of external SPI clock
  * - Handles clock domain crossing (async spi_clk to system clk)
- * - Raises interrupt when 16 bytes (128 bits) received
+ * - Raises interrupt when RX_NUM_BYTES bytes are received
  * - Little-endian byte order (LSB first)
  */
 
-module spi_slave_8lane (
+module spi_slave_8lane #(
+    parameter integer RX_NUM_BYTES = 24
+) (
     // System interface
     input  wire        clk,           // System clock
     input  wire        resetn,        // Active-low reset
@@ -19,7 +21,7 @@ module spi_slave_8lane (
     input  wire        spi_cs_n_in,   // Chip select (active low)
 
     // Output interface
-    output reg  [127:0] rx_data,      // Received 128-bit data
+    output reg  [(RX_NUM_BYTES*8)-1:0] rx_data,  // Received packet payload
     output reg         rx_valid,      // Pulses high for 1 cycle when complete
     output wire        rx_busy,       // High during active reception
     output wire        irq_rx         // Directly connects to CPU interrupt
@@ -88,17 +90,17 @@ module spi_slave_8lane (
     assign spi_data_sync = spi_data_sync2;
 
     // =========================================================================
-    // Byte Counter - counts 0 to 15 (16 bytes = 128 bits)
+    // Byte Counter - counts 0 to RX_NUM_BYTES-1
     // =========================================================================
-    reg [3:0] byte_count;
+    reg [7:0] byte_count;
     wire byte_count_done;
 
-    assign byte_count_done = (byte_count == 4'd15);
+    assign byte_count_done = (byte_count == (RX_NUM_BYTES - 1));
 
     // =========================================================================
     // Shift Register - accumulates received bytes
     // =========================================================================
-    reg [127:0] shift_reg;
+    reg [(RX_NUM_BYTES*8)-1:0] shift_reg;
 
     // =========================================================================
     // State Machine - Sequential Logic
@@ -130,7 +132,7 @@ module spi_slave_8lane (
                 if (spi_cs_n_sync) begin
                     state_next = STATE_IDLE;
                 end
-                // Check if we've received all 16 bytes
+                // Check if we've received all bytes
                 else if (byte_count_done && spi_clk_rising_edge) begin
                     state_next = STATE_COMPLETE;
                 end
@@ -170,9 +172,9 @@ module spi_slave_8lane (
 
     always @(posedge clk or negedge resetn) begin
         if (!resetn) begin
-            byte_count <= 4'd0;
-            shift_reg  <= 128'd0;
-            rx_data    <= 128'd0;
+            byte_count <= 8'd0;
+            shift_reg  <= {(RX_NUM_BYTES*8){1'b0}};
+            rx_data    <= {(RX_NUM_BYTES*8){1'b0}};
             rx_valid   <= 1'b0;
         end else begin
             // Default: clear rx_valid after one cycle
@@ -181,17 +183,16 @@ module spi_slave_8lane (
             case (state)
                 STATE_IDLE: begin
                     // Reset counter when idle
-                    byte_count <= 4'd0;
-                    shift_reg  <= 128'd0;
+                    byte_count <= 8'd0;
+                    shift_reg  <= {(RX_NUM_BYTES*8){1'b0}};
                 end
 
                 STATE_RECEIVING: begin
                     // On rising edge of SPI clock, sample data
                     if (spi_clk_rising_edge) begin
                         // Shift in new byte (little-endian: first byte goes to LSB)
-                        // Byte 0 → bits [7:0], Byte 1 → bits [15:8], etc.
-                        shift_reg <= {spi_data_sync, shift_reg[127:8]};
-                        byte_count <= byte_count + 4'd1;
+                        shift_reg <= {spi_data_sync, shift_reg[(RX_NUM_BYTES*8)-1:8]};
+                        byte_count <= byte_count + 8'd1;
                     end
                 end
 
@@ -202,11 +203,11 @@ module spi_slave_8lane (
                         rx_valid <= 1'b1;
                     end
                     // Reset counter for next transfer
-                    byte_count <= 4'd0;
+                    byte_count <= 8'd0;
                 end
 
                 default: begin
-                    byte_count <= 4'd0;
+                    byte_count <= 8'd0;
                 end
             endcase
         end

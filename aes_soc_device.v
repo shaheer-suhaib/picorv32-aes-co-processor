@@ -9,7 +9,7 @@
  *
  * Memory Map:
  *   0x00000000 - 0x00000FFF: Program/Data Memory (directly connected)
- *   0x30000000 - 0x3000001F: SPI RX Buffer registers
+ *   0x30000000 - 0x30000023: SPI RX Buffer registers
  */
 
 module aes_soc_device #(
@@ -49,7 +49,7 @@ module aes_soc_device #(
     // Memory Arbiter - Route to RAM or RX Buffer
     // =========================================================================
     wire ram_sel     = (mem_addr < 32'h1000_0000);
-    wire rxbuf_sel   = (mem_addr >= 32'h3000_0000) && (mem_addr < 32'h3000_0020);
+    wire rxbuf_sel   = (mem_addr >= 32'h3000_0000) && (mem_addr < 32'h3000_0024);
 
     // RAM signals
     reg         ram_ready;
@@ -82,11 +82,13 @@ module aes_soc_device #(
     // =========================================================================
     // SPI Slave + RX Buffer
     // =========================================================================
-    wire [127:0] spi_slave_rx_data;
+    wire [191:0] spi_slave_rx_data;
     wire         spi_slave_rx_valid;
     wire         spi_slave_rx_busy;
 
-    spi_slave_8lane spi_slave_inst (
+    spi_slave_8lane #(
+        .RX_NUM_BYTES(24)
+    ) spi_slave_inst (
         .clk         (clk),
         .resetn      (resetn),
         .spi_clk_in  (spi_rx_clk_in),

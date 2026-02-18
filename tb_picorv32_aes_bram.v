@@ -1,7 +1,7 @@
 `timescale 1 ns / 1 ps
 
 /***************************************************************
- * Testbench for PicoRV32 AES with BRAM Memory
+ * Testbench for PicoRV32 AES + SHA-256 with BRAM Memory
  *
  * This version uses actual BRAM-based memory (synthesizable)
  * instead of testbench memory simulation.
@@ -75,7 +75,9 @@ module tb_picorv32_aes_bram;
         .ENABLE_IRQ_QREGS(0),
         // **Enable AES encryption co-processor**
         .ENABLE_AES(1),
-        .ENABLE_AES_DEC(1)
+        .ENABLE_AES_DEC(1),
+        // **Enable SHA-256 hash co-processor**
+        .ENABLE_SHA256(1)
     ) cpu (
         .clk         (clk),
         .resetn      (resetn),
@@ -121,19 +123,26 @@ module tb_picorv32_aes_bram;
     reg [31:0] cycle_count = 0;
     reg [127:0] expected_ciphertext = 128'h69c4e0d86a7b0430d8cdb78070b4c55a;
 
-    // 8-Lane SPI Capture
-    reg [7:0]  spi_received_bytes [0:15];
+    // 8-Lane SPI Capture (24 bytes: 16 CT + 8-byte auth tag)
+    reg [7:0]  spi_received_bytes [0:23];
     reg [4:0]  spi_byte_count = 0;
     reg        spi_prev_clk = 0;
     reg        spi_prev_cs_n = 1;
     reg        spi_transfer_complete = 0;
     reg [127:0] received_ciphertext;
+    reg [63:0] received_tag;
+    reg [63:0] expected_tag = 64'hef9935f981202cd6;
 
     // Decryption Result Tracking
     reg [127:0] expected_plaintext = 128'h00112233445566778899aabbccddeeff;
     reg [31:0]  match_result;
     reg         match_result_valid = 0;
     reg [31:0]  dec_word0, dec_word1, dec_word2, dec_word3;
+
+    // SHA-256 Result Tracking
+    reg [31:0]  sha_digest [0:7];
+    reg [31:0]  sha_match_result;
+    reg         sha_match_valid = 0;
 
     //=========================================================
     // Cycle Counter
@@ -162,7 +171,7 @@ module tb_picorv32_aes_bram;
             spi_transfer_complete <= 1;
             $display("[Cycle %0d] SPI Transfer Complete (%0d bytes)", cycle_count, spi_byte_count);
 
-            // Reconstruct ciphertext
+            // Reconstruct ciphertext from bytes 0-15 (little-endian)
             received_ciphertext = {
                 spi_received_bytes[15], spi_received_bytes[14],
                 spi_received_bytes[13], spi_received_bytes[12],
@@ -173,31 +182,61 @@ module tb_picorv32_aes_bram;
                 spi_received_bytes[3],  spi_received_bytes[2],
                 spi_received_bytes[1],  spi_received_bytes[0]
             };
+
+            // Reconstruct 64-bit auth tag from bytes 16-23 (big-endian)
+            received_tag = {
+                spi_received_bytes[16], spi_received_bytes[17],
+                spi_received_bytes[18], spi_received_bytes[19],
+                spi_received_bytes[20], spi_received_bytes[21],
+                spi_received_bytes[22], spi_received_bytes[23]
+            };
         end
 
         // Capture data on rising edge
-        if (!aes_spi_cs_n && aes_spi_clk && !spi_prev_clk) begin
+            if (!aes_spi_cs_n && aes_spi_clk && !spi_prev_clk) begin
             spi_received_bytes[spi_byte_count] <= aes_spi_data;
-            $display("  SPI Byte[%2d] = 0x%02x", spi_byte_count, aes_spi_data);
+            if (spi_byte_count < 16)
+                $display("  SPI CT  Byte[%2d] = 0x%02x", spi_byte_count, aes_spi_data);
+            else
+                $display("  SPI TAG Byte[%2d] = 0x%02x", spi_byte_count, aes_spi_data);
             spi_byte_count <= spi_byte_count + 1;
         end
     end
 
     //=========================================================
-    // Memory Write Monitor (Decryption Results)
+    // Memory Write Monitor (Decryption + SHA-256 Results)
     //=========================================================
     always @(posedge clk) begin
         if (mem_valid && mem_ready && |mem_wstrb) begin
             case (mem_addr)
-                32'h00000500: begin
+                // Decryption match result (MATCH_ADDR = 0x330)
+                32'h00000330: begin
                     match_result <= mem_wdata;
                     match_result_valid <= 1;
-                    $display("[Cycle %0d] Match result written: %0d", cycle_count, mem_wdata);
+                    $display("[Cycle %0d] Decryption match result written: %0d", cycle_count, mem_wdata);
                 end
-                32'h00000600: dec_word0 <= mem_wdata;
-                32'h00000604: dec_word1 <= mem_wdata;
-                32'h00000608: dec_word2 <= mem_wdata;
-                32'h0000060C: dec_word3 <= mem_wdata;
+                // Decrypted plaintext (DEC_RESULT_ADDR = 0x340)
+                32'h00000340: dec_word0 <= mem_wdata;
+                32'h00000344: dec_word1 <= mem_wdata;
+                32'h00000348: dec_word2 <= mem_wdata;
+                32'h0000034C: dec_word3 <= mem_wdata;
+
+                // SHA-256 digest words (SHA_DIGEST_ADDR = 0x440)
+                32'h00000440: begin sha_digest[0] <= mem_wdata; $display("[Cycle %0d] SHA digest[0] = 0x%08x", cycle_count, mem_wdata); end
+                32'h00000444: begin sha_digest[1] <= mem_wdata; $display("[Cycle %0d] SHA digest[1] = 0x%08x", cycle_count, mem_wdata); end
+                32'h00000448: begin sha_digest[2] <= mem_wdata; $display("[Cycle %0d] SHA digest[2] = 0x%08x", cycle_count, mem_wdata); end
+                32'h0000044C: begin sha_digest[3] <= mem_wdata; $display("[Cycle %0d] SHA digest[3] = 0x%08x", cycle_count, mem_wdata); end
+                32'h00000450: begin sha_digest[4] <= mem_wdata; $display("[Cycle %0d] SHA digest[4] = 0x%08x", cycle_count, mem_wdata); end
+                32'h00000454: begin sha_digest[5] <= mem_wdata; $display("[Cycle %0d] SHA digest[5] = 0x%08x", cycle_count, mem_wdata); end
+                32'h00000458: begin sha_digest[6] <= mem_wdata; $display("[Cycle %0d] SHA digest[6] = 0x%08x", cycle_count, mem_wdata); end
+                32'h0000045C: begin sha_digest[7] <= mem_wdata; $display("[Cycle %0d] SHA digest[7] = 0x%08x", cycle_count, mem_wdata); end
+
+                // SHA-256 match result (SHA_MATCH_ADDR = 0x460)
+                32'h00000460: begin
+                    sha_match_result <= mem_wdata;
+                    sha_match_valid <= 1;
+                    $display("[Cycle %0d] SHA match result written: %0d", cycle_count, mem_wdata);
+                end
             endcase
         end
     end
@@ -222,21 +261,26 @@ module tb_picorv32_aes_bram;
     initial begin : main_test
         integer i;
         reg [127:0] decrypted_plaintext;
+        reg all_passed;
 
         $display("================================================================");
-        $display("  PicoRV32 AES Full Pipeline Test (Encrypt + Decrypt)");
+        $display("  PicoRV32 Full Pipeline Test (Encrypt + Decrypt + SHA-256)");
         $display("================================================================");
         $display("");
         $display("Configuration:");
         $display("  - Memory: BRAM-based (synthesizable)");
         $display("  - Init File: program.hex");
         $display("  - Clock: %0d MHz", 1000/CLK_PERIOD);
-        $display("  - Pipeline: Encrypt -> SPI -> Decrypt -> Verify");
+        $display("  - Pipeline: Encrypt -> SHA-256(CT||KEY) -> SPI(CT+Tag64) -> Decrypt -> SHA-256 Verify");
         $display("");
 
-        // Initialize SPI capture
-        for (i = 0; i < 16; i = i + 1)
+        all_passed = 1;
+
+        // Initialize SPI capture (24 bytes: 16 CT + 8-byte tag)
+        for (i = 0; i < 24; i = i + 1)
             spi_received_bytes[i] = 8'h00;
+        for (i = 0; i < 8; i = i + 1)
+            sha_digest[i] = 32'h0;
 
         // Reset sequence
         repeat (20) @(posedge clk);
@@ -254,18 +298,29 @@ module tb_picorv32_aes_bram;
 
                 $display("");
                 $display("================================================================");
-                $display("  SPI Transfer Complete - Verifying Encryption");
+                $display("  SPI Transfer Complete - Verifying Encryption + SHA-256 Hash");
                 $display("================================================================");
                 $display("");
-                $display("Received Ciphertext: 0x%032x", received_ciphertext);
-                $display("Expected Ciphertext: 0x%032x", expected_ciphertext);
+                $display("Received Ciphertext (SPI bytes 0-15):  0x%032x", received_ciphertext);
+                $display("Expected Ciphertext:                   0x%032x", expected_ciphertext);
+                $display("");
+                $display("Received Auth Tag (SPI bytes 16-23): 0x%016x", received_tag);
+                $display("Expected Auth Tag:                   0x%016x", expected_tag);
 
                 if (received_ciphertext == expected_ciphertext) begin
                     $display("");
-                    $display("*** ENCRYPTION TEST PASSED ***");
+                    $display("*** ENCRYPTION SPI TEST PASSED ***");
                 end else begin
                     $display("");
-                    $display("*** ENCRYPTION TEST FAILED ***");
+                    $display("*** ENCRYPTION SPI TEST FAILED ***");
+                    all_passed = 0;
+                end
+
+                if (received_tag == expected_tag) begin
+                    $display("*** AUTH TAG SPI TEST PASSED ***");
+                end else begin
+                    $display("*** AUTH TAG SPI TEST FAILED ***");
+                    all_passed = 0;
                 end
 
                 // === Phase 2: Decryption ===
@@ -291,12 +346,43 @@ module tb_picorv32_aes_bram;
                     $display("");
                     $display("*** DECRYPTION TEST FAILED ***");
                     $display("  Match result: %0d (expected 1)", match_result);
+                    all_passed = 0;
+                end
+
+                // === Phase 3: SHA-256 ===
+                wait(sha_match_valid == 1);
+
+                repeat (10) @(posedge clk);
+
+                $display("");
+                $display("================================================================");
+                $display("  SHA-256 Complete - Verifying Software Hash of (Ciphertext||Key)");
+                $display("================================================================");
+                $display("");
+                $display("SHA-256 Digest (of ciphertext||key):");
+                $display("  H[0] = 0x%08x  (expected 0xef9935f9)", sha_digest[0]);
+                $display("  H[1] = 0x%08x  (expected 0x81202cd6)", sha_digest[1]);
+                $display("  H[2] = 0x%08x  (expected 0x03abb02b)", sha_digest[2]);
+                $display("  H[3] = 0x%08x  (expected 0xe19e63f6)", sha_digest[3]);
+                $display("  H[4] = 0x%08x  (expected 0xf70c98af)", sha_digest[4]);
+                $display("  H[5] = 0x%08x  (expected 0x66e41670)", sha_digest[5]);
+                $display("  H[6] = 0x%08x  (expected 0xfe203af0)", sha_digest[6]);
+                $display("  H[7] = 0x%08x  (expected 0xeace13b8)", sha_digest[7]);
+
+                if (sha_match_result == 32'd1) begin
+                    $display("");
+                    $display("*** SHA-256 TEST PASSED ***");
+                end else begin
+                    $display("");
+                    $display("*** SHA-256 TEST FAILED ***");
+                    $display("  Match result: %0d (expected 1)", sha_match_result);
+                    all_passed = 0;
                 end
 
                 // === Final Verdict ===
                 $display("");
                 $display("================================================================");
-                if (received_ciphertext == expected_ciphertext && match_result == 32'd1) begin
+                if (all_passed) begin
                     $display("  *** FULL PIPELINE PASSED ***");
                 end else begin
                     $display("  *** PIPELINE TEST FAILED ***");
@@ -317,6 +403,7 @@ module tb_picorv32_aes_bram;
                 $display("  Cycles elapsed: %0d", TIMEOUT_CYCLES);
                 $display("  SPI complete: %0b", spi_transfer_complete);
                 $display("  Decrypt result valid: %0b", match_result_valid);
+                $display("  SHA match valid: %0b", sha_match_valid);
                 $display("");
                 $finish;
             end

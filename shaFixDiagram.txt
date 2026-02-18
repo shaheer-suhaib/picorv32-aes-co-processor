@@ -1,0 +1,151 @@
+SHA-256 DATAPATH FLOW DIAGRAM (Before vs After Fix)
+====================================================
+
+Project context:
+- Module: sha256_core (Sha-Code/sha-core.v)
+- Timing issue was on setup paths like:
+  w_mem_inst/w_mem_reg[*] -> a_reg_reg[*] (sys_clk @ 100 MHz)
+
+
+----------------------------------------------------------------------
+1) BEFORE FIX (failing timing)
+----------------------------------------------------------------------
+
+                         +----------------------+
+ round(t_ctr_reg) -----> | sha256_k_constants   |
+                         |      (module)        |
+                         |   output: k_data     |
+                         +----------+-----------+
+                                    |
+                                    v
+                         +----------------------+
+ block, round ---------->|   sha256_w_mem       |
+ init, next              |      (module)        |
+                         |   output: w_data     |
+                         +----------+-----------+
+                                    |
+                                    v
+   a_reg..h_reg ----------------> +-----------------------------+
+                                  | t1_logic / t2_logic         |
+                                  | t1 = h + S1(e)+Ch+w_data+K  |
+                                  | t2 = S0(a)+Maj              |
+                                  +---------------+-------------+
+                                                  |
+                                                  v
+                                  +-----------------------------+
+                                  | state_logic                 |
+                                  | a_new = t1 + t2             |
+                                  | e_new = d_reg + t1          |
+                                  | b..h shift updates          |
+                                  +---------------+-------------+
+                                                  |
+                                                  v
+                                  +-----------------------------+
+                                  | reg_update (a..h registers) |
+                                  | writes a_reg..h_reg         |
+                                  +-----------------------------+
+
+
+Control flow (before):
+- CTRL_ROUNDS did ALL in same cycle:
+  w_next=1, state_update=1, t_ctr_inc=1
+
+Critical path (before):
+  w_mem_reg -> w_data -> t1 adder tree -> state_logic(a_new/e_new) -> a_reg/e_reg D
+
+[Problem]
+- Too much combinational logic in one clock cycle (adder/rotate/xor chain).
+- Setup timing failed at 10 ns period.
+
+
+----------------------------------------------------------------------
+2) AFTER FIX (pipeline applied)
+----------------------------------------------------------------------
+
+New registers/signals added in sha256_core:
+- t1_reg, t2_reg
+- round_phase_reg
+- t1_t2_we, round_phase_we
+
+
+PHASE 0 (compute + capture):
+----------------------------
+
+                         +----------------------+
+ round(t_ctr_reg) -----> | sha256_k_constants   |
+                         +----------+-----------+
+                                    |
+                                    v
+                         +----------------------+
+ block, round ---------->|   sha256_w_mem       |
+ init, next              +----------+-----------+
+                                    |
+                                    v
+   a_reg..h_reg ----------------> +-----------------------------+
+                                  | t1_logic / t2_logic         |
+                                  | compute t1, t2              |
+                                  +---------------+-------------+
+                                                  |
+                                                  v
+                                  +-----------------------------+
+                                  | [FIX] pipeline capture      |
+                                  | t1_reg <= t1   (t1_t2_we)   |
+                                  | t2_reg <= t2   (t1_t2_we)   |
+                                  +-----------------------------+
+
+
+PHASE 1 (state update using registered terms):
+----------------------------------------------
+
+                                  +-----------------------------+
+                                  | state_logic                 |
+                                  | a_new = t1_reg + t2_reg     |
+                                  | e_new = d_reg + t1_reg      |
+                                  +---------------+-------------+
+                                                  |
+                                                  v
+                                  +-----------------------------+
+                                  | reg_update (a..h registers) |
+                                  | writes a_reg..h_reg         |
+                                  +-----------------------------+
+                                                  |
+                                                  v
+                                  +-----------------------------+
+                                  | round advance               |
+                                  | w_next=1, t_ctr_inc=1       |
+                                  +-----------------------------+
+
+
+Control flow (after):
+- CTRL_ROUNDS now runs in 2 internal phases:
+  Phase 0 (round_phase_reg=0): capture t1/t2 only
+  Phase 1 (round_phase_reg=1): update state, then advance round
+
+Critical path (after):
+  Phase 0 path: w_mem_reg -> t1/t2 -> t1_reg/t2_reg D
+  Phase 1 path: t1_reg/t2_reg -> state adders -> a_reg/e_reg D
+
+[What was fixed]
+- Original one long path was split into two shorter registered paths.
+- Combinational depth per cycle reduced, improving setup timing margin.
+
+[Tradeoff]
+- Each SHA round now takes 2 cycles internally (higher latency, safer timing).
+- External SHA interface behavior remains the same (ready/digest_valid protocol).
+
+
+----------------------------------------------------------------------
+3) Signal-level summary of the fix
+----------------------------------------------------------------------
+
+Before:
+  t1, t2 were purely combinational and consumed immediately by state_update.
+
+After:
+  t1, t2 -> (captured) t1_reg, t2_reg -> consumed next phase by state_update.
+
+Added control:
+  round_phase_reg toggles:
+    0: compute/capture
+    1: state update + round increment
+
