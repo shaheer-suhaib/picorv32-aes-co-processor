@@ -38,13 +38,15 @@ module spi_slave_8lane (
     // Clock Domain Crossing - Synchronize async SPI signals to system clock
     // =========================================================================
 
-    // Double-flop synchronizers for SPI clock
+    // Triple-flop synchronizers for SPI clock (3 stages for edge detection)
     reg spi_clk_sync1, spi_clk_sync2, spi_clk_sync3;
 
     // Double-flop synchronizers for chip select
     reg spi_cs_n_sync1, spi_cs_n_sync2;
 
-    // Double-flop synchronizers for data (need to be stable when sampled)
+    // Double-flop synchronizers for data
+    // Data uses 2 stages to match the clock edge detection timing
+    // When edge = (clk_sync2=1 && clk_sync3=0), data_sync2 has the correct data
     reg [7:0] spi_data_sync1, spi_data_sync2;
 
     // Edge detection for SPI clock
@@ -74,7 +76,8 @@ module spi_slave_8lane (
             spi_cs_n_sync1 <= spi_cs_n_in;
             spi_cs_n_sync2 <= spi_cs_n_sync1;
 
-            // Data synchronizer
+            // Data synchronizer (2 stages to align with clock edge detection)
+            // When edge = (clk_sync2=1 && clk_sync3=0), data_sync2 is valid
             spi_data_sync1 <= spi_data_in;
             spi_data_sync2 <= spi_data_sync1;
         end
@@ -85,7 +88,7 @@ module spi_slave_8lane (
 
     // Synchronized outputs
     assign spi_cs_n_sync = spi_cs_n_sync2;
-    assign spi_data_sync = spi_data_sync2;
+    assign spi_data_sync = spi_data_sync2;  // Use 2nd stage - aligned with clock edge detection
 
     // =========================================================================
     // Byte Counter - counts 0 to 15 (16 bytes = 128 bits)
@@ -114,13 +117,29 @@ module spi_slave_8lane (
     // =========================================================================
     // State Machine - Combinational Logic
     // =========================================================================
+    // CS falling edge detection for first byte capture
+    reg spi_cs_n_sync_prev;
+    wire cs_falling_edge;
+
+    always @(posedge clk or negedge resetn) begin
+        if (!resetn) begin
+            spi_cs_n_sync_prev <= 1'b1;
+        end else begin
+            spi_cs_n_sync_prev <= spi_cs_n_sync;
+        end
+    end
+
+    assign cs_falling_edge = spi_cs_n_sync_prev && !spi_cs_n_sync;
+
     always @(*) begin
         state_next = state;
 
         case (state)
             STATE_IDLE: begin
-                // Wait for CS to go low (transfer starting)
-                if (!spi_cs_n_sync) begin
+                // Wait for CS falling edge (new transfer starting)
+                // Using cs_falling_edge prevents false triggering from
+                // glitches or if CS is already low when we enter IDLE
+                if (cs_falling_edge) begin
                     state_next = STATE_RECEIVING;
                 end
             end
@@ -180,9 +199,19 @@ module spi_slave_8lane (
 
             case (state)
                 STATE_IDLE: begin
-                    // Reset counter when idle
-                    byte_count <= 4'd0;
-                    shift_reg  <= 128'd0;
+                    // Only reset when CS is high (truly idle)
+                    // Don't reset if we're transitioning to RECEIVING
+                    if (spi_cs_n_sync) begin
+                        byte_count <= 4'd0;
+                        shift_reg  <= 128'd0;
+                    end
+                    // CRITICAL: If CS is low AND there's a rising edge,
+                    // capture the first byte immediately! This handles the
+                    // case where CS and first clock happen at nearly the same time.
+                    else if (spi_clk_rising_edge) begin
+                        shift_reg <= {120'b0, spi_data_sync};
+                        byte_count <= 4'd1;
+                    end
                 end
 
                 STATE_RECEIVING: begin
@@ -201,7 +230,8 @@ module spi_slave_8lane (
                         rx_data  <= shift_reg;
                         rx_valid <= 1'b1;
                     end
-                    // Reset counter for next transfer
+                    // Keep shift_reg intact until we return to IDLE
+                    // Only reset byte_count, not shift_reg
                     byte_count <= 4'd0;
                 end
 

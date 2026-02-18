@@ -3246,7 +3246,7 @@ module pcpi_aes #(
 			case (state)
 			IDLE: begin
 				pcpi_wait <= 0;
-				if (pcpi_valid && instr_any) begin
+				if (pcpi_valid && instr_any && !pcpi_ready) begin
 					word_index <= pcpi_rs1[1:0];
 					pcpi_wait  <= 1;
 					state      <= EXECUTE;
@@ -3450,7 +3450,7 @@ module pcpi_aes_dec (
 			case (state)
 			IDLE: begin
 				pcpi_wait <= 0;
-				if (pcpi_valid && instr_any) begin
+				if (pcpi_valid && instr_any && !pcpi_ready) begin
 					word_index <= pcpi_rs1[1:0];  // Word index from rs1
 					pcpi_wait  <= 1;
 					state      <= EXECUTE;

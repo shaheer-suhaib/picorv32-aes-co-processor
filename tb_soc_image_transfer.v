@@ -1,52 +1,50 @@
 `timescale 1ns / 1ps
 
 /***************************************************************
- * Full SoC Image Transfer Testbench
- *
- * This testbench simulates the complete system:
+ * Two-CPU Encrypted Image Transfer Testbench
  *
  *   ┌─────────────────────────┐         ┌─────────────────────────┐
- *   │      DEVICE 1           │   SPI   │      DEVICE 2           │
- *   │     (Transmitter)       │ ══════> │      (Receiver)         │
- *   │                         │         │                         │
- *   │  ┌─────────────────┐    │         │    ┌─────────────────┐  │
- *   │  │   PicoRV32 CPU  │    │         │    │   SPI Slave     │  │
- *   │  │   + AES Encrypt │    │         │    │   8-lane RX     │  │
- *   │  │   + SPI Master  │    │         │    └────────┬────────┘  │
- *   │  └────────┬────────┘    │         │             │           │
- *   │           │             │         │             ▼           │
- *   │    ┌──────┴──────┐      │         │    ┌─────────────────┐  │
- *   │    │   Memory    │      │         │    │  AES Decrypt    │  │
- *   │    │ (firmware + │      │         │    └────────┬────────┘  │
- *   │    │  image data)│      │         │             │           │
- *   │    └─────────────┘      │         │    ┌────────┴────────┐  │
- *   │                         │         │    │     Memory      │  │
- *   └─────────────────────────┘         │    │ (decrypted img) │  │
- *                                       │    └─────────────────┘  │
- *                                       └─────────────────────────┘
+ *   │   DEVICE A (Transmitter)│  8-lane │   DEVICE B (Receiver)   │
+ *   │                         │   SPI   │                         │
+ *   │  PicoRV32 CPU           │ ══════> │  SPI Slave + RX Buffer  │
+ *   │  + AES Encrypt          │         │         ↓               │
+ *   │  + SPI Master (auto)    │         │  PicoRV32 CPU           │
+ *   │                         │         │  + AES Decrypt           │
+ *   │  BRAM: firmware +       │         │                         │
+ *   │        image data       │         │  BRAM: firmware + key + │
+ *   │        + key            │         │        decrypted output │
+ *   └─────────────────────────┘         └─────────────────────────┘
  *
  * Flow:
- * 1. Image data loaded into Device 1 memory
- * 2. PicoRV32 executes firmware to encrypt each block
- * 3. After each encryption, ciphertext auto-transmitted via 8-lane SPI
- * 4. Device 2 SPI slave receives ciphertext
- * 5. Device 2 decrypts each block
- * 6. Decrypted data stored in Device 2 memory
- * 7. Compare Device 2 memory with original image
+ * 1. Python script converts image → image_data.hex (16-byte chunks)
+ * 2. Device A firmware encrypts each 128-bit block from memory
+ * 3. Ciphertext auto-transmitted via 8-lane SPI after each encryption
+ * 4. Device B SPI slave captures block into RX buffer (memory-mapped)
+ * 5. Device B firmware polls RX buffer, reads ciphertext
+ * 6. Device B loads ciphertext into AES decrypt coprocessor
+ * 7. Device B stores decrypted plaintext to output memory
+ * 8. Testbench writes decrypted output → decrypted_output.hex
+ * 9. Python script reconstructs image from hex
+ 
  ***************************************************************/
+
+// Number of 128-bit AES blocks in the image (set via -DIMAGE_NUM_BLOCKS=N)
+`ifndef IMAGE_NUM_BLOCKS
+`define IMAGE_NUM_BLOCKS 256
+`endif
 
 module tb_soc_image_transfer;
 
     //=========================================================
     // Parameters
     //=========================================================
-    parameter CLK_PERIOD = 10;          // 100 MHz
-    parameter MEM_SIZE = 2048;          // 2K words = 8KB memory
-    parameter MAX_BLOCKS = 256;         // Max image blocks (4KB image)
-    parameter TIMEOUT_CYCLES = 500000;  // Simulation timeout
+    parameter CLK_PERIOD     = 10;
+    parameter NUM_BLOCKS     = `IMAGE_NUM_BLOCKS;
+    parameter MEM_SIZE       = (NUM_BLOCKS * 4) + 512;  // image words + firmware/key overhead
+    parameter TIMEOUT_CYCLES = NUM_BLOCKS * 2000 + 50000;
 
     //=========================================================
-    // AES Key (must match on both devices)
+    // AES Key (same on both devices)
     //=========================================================
     localparam [127:0] AES_KEY = 128'h000102030405060708090a0b0c0d0e0f;
 
@@ -59,240 +57,135 @@ module tb_soc_image_transfer;
     always #(CLK_PERIOD/2) clk = ~clk;
 
     //=========================================================
-    // Device 1: PicoRV32 + AES + SPI Master (Transmitter)
+    // Device Signals
     //=========================================================
-    wire        trap;
+    wire        trap_a, trap_b;
 
-    // Memory interface
-    wire        mem_valid;
-    wire        mem_instr;
-    reg         mem_ready;
-    wire [31:0] mem_addr;
-    wire [31:0] mem_wdata;
-    wire [3:0]  mem_wstrb;
-    reg  [31:0] mem_rdata;
-
-    // 8-Lane SPI outputs from PicoRV32
+    // SPI bus: Device A TX → Device B RX
     wire [7:0]  spi_data;
-    wire        spi_clk;
+    wire        spi_clk_w;
     wire        spi_cs_n;
     wire        spi_active;
-
-    // Device 1 Memory
-    reg [31:0] dev1_memory [0:MEM_SIZE-1];
-
-    //=========================================================
-    // Device 2: SPI Slave + AES Decrypt (Receiver)
-    //=========================================================
-    // SPI Slave signals
-    wire [127:0] rx_block_data;
-    wire         rx_block_valid;
-
-    // AES Decryption signals
-    reg  [127:0] dec_ciphertext;
-    reg  [127:0] dec_key;
-    reg          dec_start;
-    wire [127:0] dec_plaintext;
-    wire         dec_done;
-
-    // Device 2 Memory for decrypted data
-    reg [127:0] dev2_memory [0:MAX_BLOCKS-1];
-    integer     dev2_block_count;
+    wire        spi_rx_irq;
 
     //=========================================================
     // Test Control
     //=========================================================
-    integer i, j;
-    integer num_blocks;
     integer cycle_count;
-    integer blocks_encrypted;
-    integer blocks_received;
-    integer blocks_decrypted;
+    integer blocks_sent;
     integer errors;
-
-    // Original image data for comparison
-    reg [127:0] original_image [0:MAX_BLOCKS-1];
+    integer fd;
 
     //=========================================================
-    // VCD Dump
+    // VCD Dump (disabled by default for large images)
     //=========================================================
+`ifdef DUMP_VCD
     initial begin
         $dumpfile("tb_soc_image_transfer.vcd");
         $dumpvars(0, tb_soc_image_transfer);
     end
+`endif
 
     //=========================================================
-    // Instantiate PicoRV32 (Device 1 - Transmitter)
+    // Device A: Transmitter (PicoRV32 + AES Encrypt + SPI TX)
     //=========================================================
-    picorv32 #(
-        .ENABLE_COUNTERS     (0),
-        .ENABLE_COUNTERS64   (0),
-        .ENABLE_REGS_16_31   (1),
-        .ENABLE_REGS_DUALPORT(1),
-        .LATCHED_MEM_RDATA   (0),
-        .TWO_STAGE_SHIFT     (0),
-        .BARREL_SHIFTER      (1),
-        .TWO_CYCLE_COMPARE   (0),
-        .TWO_CYCLE_ALU       (0),
-        .COMPRESSED_ISA      (1),
-        .CATCH_MISALIGN      (0),
-        .CATCH_ILLINSN       (0),
-        .ENABLE_PCPI         (0),
-        .ENABLE_MUL          (0),
-        .ENABLE_FAST_MUL     (0),
-        .ENABLE_DIV          (0),
-        .ENABLE_IRQ          (0),
-        .ENABLE_IRQ_QREGS    (0),
-        .ENABLE_IRQ_TIMER    (0),
-        .ENABLE_TRACE        (0),
-        .ENABLE_AES          (1),   // Enable AES encryption
-        .ENABLE_AES_DEC      (0)    // No decryption on transmitter
-    ) pico_tx (
-        .clk           (clk),
-        .resetn        (resetn),
-        .trap          (trap),
-
-        .mem_valid     (mem_valid),
-        .mem_instr     (mem_instr),
-        .mem_ready     (mem_ready),
-        .mem_addr      (mem_addr),
-        .mem_wdata     (mem_wdata),
-        .mem_wstrb     (mem_wstrb),
-        .mem_rdata     (mem_rdata),
-
-        // 8-Lane SPI outputs
-        .aes_spi_data  (spi_data),
-        .aes_spi_clk   (spi_clk),
-        .aes_spi_cs_n  (spi_cs_n),
-        .aes_spi_active(spi_active),
-
-        // Unused
-        .mem_la_read   (),
-        .mem_la_write  (),
-        .mem_la_addr   (),
-        .mem_la_wdata  (),
-        .mem_la_wstrb  (),
-        .pcpi_valid    (),
-        .pcpi_insn     (),
-        .pcpi_rs1      (),
-        .pcpi_rs2      (),
-        .pcpi_wr       (1'b0),
-        .pcpi_rd       (32'b0),
-        .pcpi_wait     (1'b0),
-        .pcpi_ready    (1'b0),
-        .irq           (32'b0),
-        .eoi           (),
-        .trace_valid   (),
-        .trace_data    ()
+    aes_soc_device #(
+        .MEM_SIZE_WORDS (MEM_SIZE),
+        .PROGADDR_RESET (32'h0000_0000)
+    ) device_a (
+        .clk            (clk),
+        .resetn         (resetn),
+        .trap           (trap_a),
+        // SPI TX → Device B
+        .spi_tx_data    (spi_data),
+        .spi_tx_clk     (spi_clk_w),
+        .spi_tx_cs_n    (spi_cs_n),
+        .spi_tx_active  (spi_active),
+        // SPI RX unused (tie inactive)
+        .spi_rx_clk_in  (1'b0),
+        .spi_rx_data_in (8'b0),
+        .spi_rx_cs_n_in (1'b1),
+        .spi_rx_irq     ()
     );
 
     //=========================================================
-    // Device 1 Memory Controller
+    // Device B: Receiver (SPI Slave + RX Buffer + PicoRV32 + AES Decrypt)
     //=========================================================
-    always @(posedge clk) begin
-        mem_ready <= 0;
-        if (resetn && mem_valid && !mem_ready) begin
-            mem_ready <= 1;
-            mem_rdata <= dev1_memory[mem_addr[31:2] & (MEM_SIZE-1)];
-            if (mem_wstrb[0]) dev1_memory[mem_addr[31:2] & (MEM_SIZE-1)][7:0]   <= mem_wdata[7:0];
-            if (mem_wstrb[1]) dev1_memory[mem_addr[31:2] & (MEM_SIZE-1)][15:8]  <= mem_wdata[15:8];
-            if (mem_wstrb[2]) dev1_memory[mem_addr[31:2] & (MEM_SIZE-1)][23:16] <= mem_wdata[23:16];
-            if (mem_wstrb[3]) dev1_memory[mem_addr[31:2] & (MEM_SIZE-1)][31:24] <= mem_wdata[31:24];
-        end
-    end
-
-    //=========================================================
-    // Instantiate SPI Slave 8-Lane (Device 2 - Receiver)
-    //=========================================================
-    spi_slave_8lane spi_rx (
-        .clk        (clk),
-        .resetn     (resetn),
-
-        // SPI interface (directly connected to PicoRV32's SPI master)
-        .spi_clk_in (spi_clk),
-        .spi_cs_n_in(spi_cs_n),
-        .spi_data_in(spi_data),
-
-        // Block output
-        .rx_data    (rx_block_data),
-        .rx_valid   (rx_block_valid),
-        .rx_busy    (),
-        .irq_rx     ()
+    aes_soc_device #(
+        .MEM_SIZE_WORDS (MEM_SIZE),
+        .PROGADDR_RESET (32'h0000_0000)
+    ) device_b (
+        .clk            (clk),
+        .resetn         (resetn),
+        .trap           (trap_b),
+        // SPI TX unused
+        .spi_tx_data    (),
+        .spi_tx_clk     (),
+        .spi_tx_cs_n    (),
+        .spi_tx_active  (),
+        // SPI RX ← Device A
+        .spi_rx_clk_in  (spi_clk_w),
+        .spi_rx_data_in (spi_data),
+        .spi_rx_cs_n_in (spi_cs_n),
+        .spi_rx_irq     (spi_rx_irq)
     );
 
     //=========================================================
-    // Instantiate AES Decryption (Device 2)
+    // RISC-V Instruction Encoding Helpers
     //=========================================================
-    ASMD_Decryption aes_decrypt (
-        .done       (dec_done),
-        .Dout       (dec_plaintext),
-        .encrypted_text_in (dec_ciphertext),
-        .key_in     (dec_key),
-        .decrypt    (dec_start),
-        .clock      (clk),
-        .reset      (!resetn)
-    );
 
-    //=========================================================
-    // Device 2 State Machine - Receive, Decrypt, Store
-    //=========================================================
-    localparam RX_IDLE = 0, RX_DECRYPT_START = 1, RX_DECRYPT_WAIT = 2, RX_STORE = 3;
-    reg [2:0] rx_state;
+    // LUI rd, imm20
+    function [31:0] lui;
+        input [4:0] rd;
+        input [19:0] imm;
+        lui = {imm, rd, 7'b0110111};
+    endfunction
 
-    always @(posedge clk or negedge resetn) begin
-        if (!resetn) begin
-            rx_state <= RX_IDLE;
-            dec_start <= 0;
-            dec_ciphertext <= 0;
-            dec_key <= AES_KEY;
-            dev2_block_count <= 0;
-        end else begin
-            dec_start <= 0;
+    // ADDI rd, rs1, imm12
+    function [31:0] addi;
+        input [4:0] rd, rs1;
+        input [11:0] imm;
+        addi = {imm, rs1, 3'b000, rd, 7'b0010011};
+    endfunction
 
-            case (rx_state)
-                RX_IDLE: begin
-                    if (rx_block_valid) begin
-                        // Received a block via SPI (rx_valid pulses for 1 cycle)
-                        dec_ciphertext <= rx_block_data;
-                        blocks_received <= blocks_received + 1;
-                        rx_state <= RX_DECRYPT_START;
-                    end
-                end
+    // LW rd, imm12(rs1)
+    function [31:0] lw;
+        input [4:0] rd, rs1;
+        input [11:0] imm;
+        lw = {imm, rs1, 3'b010, rd, 7'b0000011};
+    endfunction
 
-                RX_DECRYPT_START: begin
-                    // Start decryption - hold for 2 cycles for proper capture
-                    dec_start <= 1;
-                    rx_state <= RX_DECRYPT_WAIT;
-                end
+    // SW rs2, imm12(rs1)
+    function [31:0] sw;
+        input [4:0] rs2, rs1;
+        input [11:0] imm;
+        sw = {imm[11:5], rs2, rs1, 3'b010, imm[4:0], 7'b0100011};
+    endfunction
 
-                RX_DECRYPT_WAIT: begin
-                    if (dec_done) begin
-                        rx_state <= RX_STORE;
-                    end
-                end
+    // BEQ rs1, rs2, imm13
+    function [31:0] beq;
+        input [4:0] rs1, rs2;
+        input [12:0] imm;
+        beq = {imm[12], imm[10:5], rs2, rs1, 3'b000, imm[4:1], imm[11], 7'b1100011};
+    endfunction
 
-                RX_STORE: begin
-                    // Store decrypted plaintext
-                    dev2_memory[dev2_block_count] <= dec_plaintext;
-                    dev2_block_count <= dev2_block_count + 1;
-                    blocks_decrypted <= blocks_decrypted + 1;
-                    rx_state <= RX_IDLE;
-                end
-            endcase
-        end
-    end
+    // BNE rs1, rs2, imm13
+    function [31:0] bne;
+        input [4:0] rs1, rs2;
+        input [12:0] imm;
+        bne = {imm[12], imm[10:5], rs2, rs1, 3'b001, imm[4:1], imm[11], 7'b1100011};
+    endfunction
+
+    // JAL rd, imm21
+    function [31:0] jal;
+        input [4:0] rd;
+        input [20:0] imm;
+        jal = {imm[20], imm[10:1], imm[11], imm[19:12], rd, 7'b1101111};
+    endfunction
 
     //=========================================================
-    // Custom AES Instructions (from firmware/custom_ops.S)
+    // AES Encryption Custom Instructions (funct7 = 0x20-0x24)
     //=========================================================
-    // Opcode 0x0B (custom-0), funct3=0x0
-    // funct7 determines operation:
-    //   0100000 (0x20) = AES_LOAD_PT  - Load plaintext word
-    //   0100001 (0x21) = AES_LOAD_KEY - Load key word
-    //   0100010 (0x22) = AES_START    - Start encryption
-    //   0100011 (0x23) = AES_READ     - Read ciphertext word
-    //   0100100 (0x24) = AES_STATUS   - Check if done
-
     function [31:0] aes_load_pt;
         input [4:0] rd, rs1, rs2;
         aes_load_pt = {7'b0100000, rs2, rs1, 3'b000, rd, 7'b0001011};
@@ -308,446 +201,370 @@ module tb_soc_image_transfer;
         aes_start = {7'b0100010, rs2, rs1, 3'b000, rd, 7'b0001011};
     endfunction
 
-    function [31:0] aes_read;
-        input [4:0] rd, rs1, rs2;
-        aes_read = {7'b0100011, rs2, rs1, 3'b000, rd, 7'b0001011};
-    endfunction
-
-    function [31:0] aes_status;
-        input [4:0] rd, rs1, rs2;
-        aes_status = {7'b0100100, rs2, rs1, 3'b000, rd, 7'b0001011};
-    endfunction
-
-    // Standard RISC-V instructions
-    function [31:0] lui;
-        input [4:0] rd;
-        input [19:0] imm;
-        lui = {imm, rd, 7'b0110111};
-    endfunction
-
-    function [31:0] addi;
-        input [4:0] rd, rs1;
-        input [11:0] imm;
-        addi = {imm, rs1, 3'b000, rd, 7'b0010011};
-    endfunction
-
-    function [31:0] ori;
-        input [4:0] rd, rs1;
-        input [11:0] imm;
-        ori = {imm, rs1, 3'b110, rd, 7'b0010011};
-    endfunction
-
-    function [31:0] lw;
-        input [4:0] rd, rs1;
-        input [11:0] imm;
-        lw = {imm, rs1, 3'b010, rd, 7'b0000011};
-    endfunction
-
-    function [31:0] sw;
-        input [4:0] rs2, rs1;
-        input [11:0] imm;
-        sw = {imm[11:5], rs2, rs1, 3'b010, imm[4:0], 7'b0100011};
-    endfunction
-
-    function [31:0] beq;
-        input [4:0] rs1, rs2;
-        input [12:0] imm;
-        beq = {imm[12], imm[10:5], rs2, rs1, 3'b000, imm[4:1], imm[11], 7'b1100011};
-    endfunction
-
-    function [31:0] bne;
-        input [4:0] rs1, rs2;
-        input [12:0] imm;
-        bne = {imm[12], imm[10:5], rs2, rs1, 3'b001, imm[4:1], imm[11], 7'b1100011};
-    endfunction
-
-    function [31:0] jal;
-        input [4:0] rd;
-        input [20:0] imm;
-        jal = {imm[20], imm[10:1], imm[11], imm[19:12], rd, 7'b1101111};
-    endfunction
-
-    function [31:0] nop;
-        input dummy;
-        nop = 32'h00000013;  // addi x0, x0, 0
-    endfunction
-
     //=========================================================
-    // Test Data - Small test image (4 blocks = 64 bytes)
+    // AES Decryption Custom Instructions (funct7 = 0x28-0x2C)
     //=========================================================
-    localparam NUM_TEST_BLOCKS = 4;
+    function [31:0] aes_dec_load_ct;
+        input [4:0] rd, rs1, rs2;
+        aes_dec_load_ct = {7'b0101000, rs2, rs1, 3'b000, rd, 7'b0001011};
+    endfunction
 
-    // Test plaintext blocks
-    localparam [127:0] TEST_PT_0 = 128'h00112233445566778899aabbccddeeff;
-    localparam [127:0] TEST_PT_1 = 128'hffeeddccbbaa99887766554433221100;
-    localparam [127:0] TEST_PT_2 = 128'h0f1e2d3c4b5a69788796a5b4c3d2e1f0;
-    localparam [127:0] TEST_PT_3 = 128'hdeadbeefcafebabe0123456789abcdef;
+    function [31:0] aes_dec_load_key;
+        input [4:0] rd, rs1, rs2;
+        aes_dec_load_key = {7'b0101001, rs2, rs1, 3'b000, rd, 7'b0001011};
+    endfunction
+
+    function [31:0] aes_dec_start;
+        input [4:0] rd, rs1, rs2;
+        aes_dec_start = {7'b0101010, rs2, rs1, 3'b000, rd, 7'b0001011};
+    endfunction
+
+    function [31:0] aes_dec_read;
+        input [4:0] rd, rs1, rs2;
+        aes_dec_read = {7'b0101011, rs2, rs1, 3'b000, rd, 7'b0001011};
+    endfunction
 
     //=========================================================
     // Main Test Sequence
     //=========================================================
+    integer i;
+
     initial begin
         $display("");
         $display("================================================================");
-        $display("  Full SoC Image Transfer Test");
-        $display("  PicoRV32 + AES Encrypt + 8-Lane SPI --> SPI Slave + AES Decrypt");
+        $display("  Two-CPU Encrypted Image Transfer");
+        $display("  AES-128 Encrypt --> 8-Lane SPI --> AES-128 Decrypt");
+        $display("================================================================");
+        $display("  Image: %0d blocks (%0d bytes)", NUM_BLOCKS, NUM_BLOCKS * 16);
+        $display("  Memory: %0d words per device (%0d KB)", MEM_SIZE, MEM_SIZE * 4 / 1024);
+        $display("  Timeout: %0d cycles", TIMEOUT_CYCLES);
         $display("================================================================");
         $display("");
 
         // Initialize
         resetn = 0;
         cycle_count = 0;
-        blocks_encrypted = 0;
-        blocks_received = 0;
-        blocks_decrypted = 0;
+        blocks_sent = 0;
         errors = 0;
-        num_blocks = NUM_TEST_BLOCKS;
-
-        // Initialize Device 1 memory to NOPs
-        for (i = 0; i < MEM_SIZE; i = i + 1)
-            dev1_memory[i] = 32'h00000013;
-
-        // Initialize Device 2 memory
-        for (i = 0; i < MAX_BLOCKS; i = i + 1)
-            dev2_memory[i] = 128'h0;
-
-        // Store original image for later comparison
-        original_image[0] = TEST_PT_0;
-        original_image[1] = TEST_PT_1;
-        original_image[2] = TEST_PT_2;
-        original_image[3] = TEST_PT_3;
-
-        $display("Loading firmware and image data into Device 1 memory...");
 
         //=====================================================
-        // Load Firmware into Device 1 Memory
+        // Initialize both memories to NOPs
         //=====================================================
+        for (i = 0; i < MEM_SIZE; i = i + 1) begin
+            device_a.memory[i] = 32'h00000013;
+            device_b.memory[i] = 32'h00000013;
+        end
+
+        //=====================================================
+        // DEVICE A FIRMWARE: Encrypt and transmit all blocks
+        //=====================================================
+        // Register usage:
+        //   x1 = word index (0-3)
+        //   x2 = plaintext pointer (increments by 16 each block)
+        //   x3 = key base address (0x200)
+        //   x4 = block counter (num_blocks → 0)
+        //   x5 = data temp
+        //   x6 = delay counter
+        //
         // Memory map:
-        //   0x0000 - 0x00FF: Firmware (instructions)
-        //   0x0100 - 0x010F: AES Key (4 words)
-        //   0x0200 - 0x02FF: Image data (plaintext blocks)
-        //   0x0300 - 0x03FF: Results storage
-
-        // Store AES key at 0x100
-        dev1_memory['h100 >> 2] = AES_KEY[31:0];
-        dev1_memory['h104 >> 2] = AES_KEY[63:32];
-        dev1_memory['h108 >> 2] = AES_KEY[95:64];
-        dev1_memory['h10C >> 2] = AES_KEY[127:96];
-
-        // Store image plaintext at 0x200 (4 words per block)
-        // Block 0
-        dev1_memory['h200 >> 2] = TEST_PT_0[31:0];
-        dev1_memory['h204 >> 2] = TEST_PT_0[63:32];
-        dev1_memory['h208 >> 2] = TEST_PT_0[95:64];
-        dev1_memory['h20C >> 2] = TEST_PT_0[127:96];
-        // Block 1
-        dev1_memory['h210 >> 2] = TEST_PT_1[31:0];
-        dev1_memory['h214 >> 2] = TEST_PT_1[63:32];
-        dev1_memory['h218 >> 2] = TEST_PT_1[95:64];
-        dev1_memory['h21C >> 2] = TEST_PT_1[127:96];
-        // Block 2
-        dev1_memory['h220 >> 2] = TEST_PT_2[31:0];
-        dev1_memory['h224 >> 2] = TEST_PT_2[63:32];
-        dev1_memory['h228 >> 2] = TEST_PT_2[95:64];
-        dev1_memory['h22C >> 2] = TEST_PT_2[127:96];
-        // Block 3
-        dev1_memory['h230 >> 2] = TEST_PT_3[31:0];
-        dev1_memory['h234 >> 2] = TEST_PT_3[63:32];
-        dev1_memory['h238 >> 2] = TEST_PT_3[95:64];
-        dev1_memory['h23C >> 2] = TEST_PT_3[127:96];
-
-        //=====================================================
-        // Firmware: Encrypt and transmit all blocks
-        //=====================================================
-        // Using a simpler approach: unrolled loop for 4 blocks
-        // This avoids branch offset calculation issues
+        //   0x000-0x0FF: Firmware
+        //   0x200-0x20F: AES key (16 bytes)
+        //   0x300:       NUM_BLOCKS (loaded by firmware with lw)
+        //   0x400+:      Image plaintext data (loaded from image_data.hex)
 
         i = 0;
 
-        // ===== BLOCK 0 =====
-        // Load key
-        dev1_memory[i] = lui(8, AES_KEY[31:12]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[11:0]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 0);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
+        // Setup
+        device_a.memory[i] = addi(3, 0, 12'h200);                i=i+1;  // x3 = 0x200 (key base)
+        device_a.memory[i] = addi(2, 0, 12'h400);                i=i+1;  // x2 = 0x400 (image base)
+        device_a.memory[i] = lw(4, 0, 12'h300);                  i=i+1;  // x4 = mem[0x300] = num_blocks
 
-        dev1_memory[i] = lui(8, AES_KEY[63:44]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[43:32]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 1);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
+        // block_loop: (instruction 3, address 0x0C)
+        // Load 4 plaintext words from mem[x2] into AES encrypt
+        device_a.memory[i] = addi(1, 0, 0);                      i=i+1;  // x1 = 0
+        device_a.memory[i] = lw(5, 2, 12'h000);                  i=i+1;  // x5 = mem[x2+0]
+        device_a.memory[i] = aes_load_pt(0, 1, 5);               i=i+1;
+        device_a.memory[i] = addi(1, 0, 1);                      i=i+1;  // x1 = 1
+        device_a.memory[i] = lw(5, 2, 12'h004);                  i=i+1;
+        device_a.memory[i] = aes_load_pt(0, 1, 5);               i=i+1;
+        device_a.memory[i] = addi(1, 0, 2);                      i=i+1;  // x1 = 2
+        device_a.memory[i] = lw(5, 2, 12'h008);                  i=i+1;
+        device_a.memory[i] = aes_load_pt(0, 1, 5);               i=i+1;
+        device_a.memory[i] = addi(1, 0, 3);                      i=i+1;  // x1 = 3
+        device_a.memory[i] = lw(5, 2, 12'h00c);                  i=i+1;
+        device_a.memory[i] = aes_load_pt(0, 1, 5);               i=i+1;
 
-        dev1_memory[i] = lui(8, AES_KEY[95:76]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[75:64]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 2);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
+        // Load 4 key words from mem[x3] into AES encrypt
+        device_a.memory[i] = addi(1, 0, 0);                      i=i+1;
+        device_a.memory[i] = lw(5, 3, 12'h000);                  i=i+1;
+        device_a.memory[i] = aes_load_key(0, 1, 5);              i=i+1;
+        device_a.memory[i] = addi(1, 0, 1);                      i=i+1;
+        device_a.memory[i] = lw(5, 3, 12'h004);                  i=i+1;
+        device_a.memory[i] = aes_load_key(0, 1, 5);              i=i+1;
+        device_a.memory[i] = addi(1, 0, 2);                      i=i+1;
+        device_a.memory[i] = lw(5, 3, 12'h008);                  i=i+1;
+        device_a.memory[i] = aes_load_key(0, 1, 5);              i=i+1;
+        device_a.memory[i] = addi(1, 0, 3);                      i=i+1;
+        device_a.memory[i] = lw(5, 3, 12'h00c);                  i=i+1;
+        device_a.memory[i] = aes_load_key(0, 1, 5);              i=i+1;
 
-        dev1_memory[i] = lui(8, AES_KEY[127:108]); i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[107:96]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 3);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
+        // Encrypt + auto SPI send (CPU blocks until done)
+        device_a.memory[i] = aes_start(0, 0, 0);                 i=i+1;
 
-        // Load plaintext block 0
-        dev1_memory[i] = lui(8, TEST_PT_0[31:12]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_0[11:0]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 0);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        // Delay loop: give Device B time to poll, decrypt, and clear
+        // x6 = 100, then count down (~800 cycles delay per block)
+        device_a.memory[i] = addi(6, 0, 12'd100);                i=i+1;  // x6 = 100
+        // delay_loop:
+        device_a.memory[i] = addi(6, 6, -1);                     i=i+1;  // x6 -= 1
+        device_a.memory[i] = bne(6, 0, -13'd4);                  i=i+1;  // → delay_loop
 
-        dev1_memory[i] = lui(8, TEST_PT_0[63:44]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_0[43:32]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 1);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        // Loop control
+        device_a.memory[i] = addi(2, 2, 16);                     i=i+1;  // x2 += 16 (next block)
+        device_a.memory[i] = addi(4, 4, -1);                     i=i+1;  // x4 -= 1
+        device_a.memory[i] = bne(4, 0, -13'd120);                i=i+1;  // → block_loop (addr 0x0C)
 
-        dev1_memory[i] = lui(8, TEST_PT_0[95:76]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_0[75:64]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 2);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        // Halt (infinite loop)
+        device_a.memory[i] = jal(0, 21'd0);                      i=i+1;
 
-        dev1_memory[i] = lui(8, TEST_PT_0[127:108]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_0[107:96]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 3);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        $display("Device A firmware: %0d instructions", i);
 
-        // Start encryption
-        dev1_memory[i] = aes_start(0, 0, 0);      i=i+1;
+        // Store AES key at 0x200
+        device_a.memory['h200 >> 2] = AES_KEY[31:0];
+        device_a.memory['h204 >> 2] = AES_KEY[63:32];
+        device_a.memory['h208 >> 2] = AES_KEY[95:64];
+        device_a.memory['h20C >> 2] = AES_KEY[127:96];
 
-        // Wait for done
-        dev1_memory[i] = aes_status(10, 0, 0);    i=i+1;
-        dev1_memory[i] = beq(10, 0, -13'd4);      i=i+1;
+        // Store block count at 0x300 (firmware reads with lw)
+        device_a.memory['h300 >> 2] = NUM_BLOCKS;
 
-        // Delay for SPI
-        dev1_memory[i] = addi(11, 0, 200);        i=i+1;
-        dev1_memory[i] = addi(11, 11, -1);        i=i+1;
-        dev1_memory[i] = bne(11, 0, -13'd4);      i=i+1;
+        // Load image data from hex file at 0x400
+        $readmemh("image_data.hex", device_a.memory, 'h400 >> 2);
 
-        // ===== BLOCK 1 =====
-        // Load plaintext block 1 (key already loaded)
-        dev1_memory[i] = lui(8, TEST_PT_1[31:12]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_1[11:0]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 0);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        $display("Loaded image_data.hex into Device A memory at 0x400");
 
-        dev1_memory[i] = lui(8, TEST_PT_1[63:44]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_1[43:32]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 1);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        //=====================================================
+        // DEVICE B FIRMWARE: Poll RX buffer, decrypt, store
+        //=====================================================
+        // Register usage:
+        //   x1  = word index (0-3)
+        //   x2  = output pointer (increments by 16)
+        //   x3  = key base address (0x200)
+        //   x4  = block counter (num_blocks → 0)
+        //   x5  = data temp
+        //   x6  = temp
+        //   x10 = RX buffer base (0x30000000)
+        //
+        // Memory map:
+        //   0x000-0x0FF:    Firmware
+        //   0x200-0x20F:    AES key
+        //   0x300:          NUM_BLOCKS
+        //   0x304:          Completion flag (set to 1 when done)
+        //   0x400+:         Decrypted image output
+        //   0x30000000+:    RX buffer registers (memory-mapped I/O)
 
-        dev1_memory[i] = lui(8, TEST_PT_1[95:76]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_1[75:64]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 2);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        i = 0;
 
-        dev1_memory[i] = lui(8, TEST_PT_1[127:108]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_1[107:96]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 3);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        // Setup
+        device_b.memory[i] = lui(10, 20'h30000);                 i=i+1;  // x10 = 0x30000000
+        device_b.memory[i] = addi(3, 0, 12'h200);                i=i+1;  // x3 = 0x200 (key base)
+        device_b.memory[i] = addi(2, 0, 12'h400);                i=i+1;  // x2 = 0x400 (output base)
+        device_b.memory[i] = lw(4, 0, 12'h300);                  i=i+1;  // x4 = mem[0x300] = num_blocks
 
-        // Reload key for block 1 (required after previous encryption)
-        dev1_memory[i] = lui(8, AES_KEY[31:12]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[11:0]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 0);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
+        // poll: (instruction 4, address 0x10)
+        device_b.memory[i] = lw(5, 10, 12'h000);                 i=i+1;  // x5 = RX_STATUS
+        device_b.memory[i] = beq(5, 0, -13'd4);                  i=i+1;  // if 0, loop to poll
 
-        dev1_memory[i] = lui(8, AES_KEY[63:44]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[43:32]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 1);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
+        // Load 4 ciphertext words from RX buffer into AES decrypt
+        device_b.memory[i] = lw(5, 10, 12'h004);                 i=i+1;  // x5 = RX_DATA_0
+        device_b.memory[i] = addi(1, 0, 0);                      i=i+1;
+        device_b.memory[i] = aes_dec_load_ct(0, 1, 5);           i=i+1;
+        device_b.memory[i] = lw(5, 10, 12'h008);                 i=i+1;  // x5 = RX_DATA_1
+        device_b.memory[i] = addi(1, 0, 1);                      i=i+1;
+        device_b.memory[i] = aes_dec_load_ct(0, 1, 5);           i=i+1;
+        device_b.memory[i] = lw(5, 10, 12'h00c);                 i=i+1;  // x5 = RX_DATA_2
+        device_b.memory[i] = addi(1, 0, 2);                      i=i+1;
+        device_b.memory[i] = aes_dec_load_ct(0, 1, 5);           i=i+1;
+        device_b.memory[i] = lw(5, 10, 12'h010);                 i=i+1;  // x5 = RX_DATA_3
+        device_b.memory[i] = addi(1, 0, 3);                      i=i+1;
+        device_b.memory[i] = aes_dec_load_ct(0, 1, 5);           i=i+1;
 
-        dev1_memory[i] = lui(8, AES_KEY[95:76]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[75:64]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 2);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
+        // Load 4 key words from mem[x3] into AES decrypt
+        device_b.memory[i] = addi(1, 0, 0);                      i=i+1;
+        device_b.memory[i] = lw(5, 3, 12'h000);                  i=i+1;
+        device_b.memory[i] = aes_dec_load_key(0, 1, 5);          i=i+1;
+        device_b.memory[i] = addi(1, 0, 1);                      i=i+1;
+        device_b.memory[i] = lw(5, 3, 12'h004);                  i=i+1;
+        device_b.memory[i] = aes_dec_load_key(0, 1, 5);          i=i+1;
+        device_b.memory[i] = addi(1, 0, 2);                      i=i+1;
+        device_b.memory[i] = lw(5, 3, 12'h008);                  i=i+1;
+        device_b.memory[i] = aes_dec_load_key(0, 1, 5);          i=i+1;
+        device_b.memory[i] = addi(1, 0, 3);                      i=i+1;
+        device_b.memory[i] = lw(5, 3, 12'h00c);                  i=i+1;
+        device_b.memory[i] = aes_dec_load_key(0, 1, 5);          i=i+1;
 
-        dev1_memory[i] = lui(8, AES_KEY[127:108]); i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[107:96]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 3);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
+        // Decrypt (CPU blocks until done)
+        device_b.memory[i] = aes_dec_start(0, 0, 0);             i=i+1;
 
-        dev1_memory[i] = aes_start(0, 0, 0);      i=i+1;
-        dev1_memory[i] = aes_status(10, 0, 0);    i=i+1;
-        dev1_memory[i] = beq(10, 0, -13'd4);      i=i+1;
-        dev1_memory[i] = addi(11, 0, 200);        i=i+1;
-        dev1_memory[i] = addi(11, 11, -1);        i=i+1;
-        dev1_memory[i] = bne(11, 0, -13'd4);      i=i+1;
+        // Read 4 decrypted words and store to output memory
+        device_b.memory[i] = addi(1, 0, 0);                      i=i+1;
+        device_b.memory[i] = aes_dec_read(5, 1, 0);              i=i+1;  // x5 = plaintext[31:0]
+        device_b.memory[i] = sw(5, 2, 12'd0);                    i=i+1;  // mem[x2+0] = x5
+        device_b.memory[i] = addi(1, 0, 1);                      i=i+1;
+        device_b.memory[i] = aes_dec_read(5, 1, 0);              i=i+1;  // x5 = plaintext[63:32]
+        device_b.memory[i] = sw(5, 2, 12'd4);                    i=i+1;
+        device_b.memory[i] = addi(1, 0, 2);                      i=i+1;
+        device_b.memory[i] = aes_dec_read(5, 1, 0);              i=i+1;  // x5 = plaintext[95:64]
+        device_b.memory[i] = sw(5, 2, 12'd8);                    i=i+1;
+        device_b.memory[i] = addi(1, 0, 3);                      i=i+1;
+        device_b.memory[i] = aes_dec_read(5, 1, 0);              i=i+1;  // x5 = plaintext[127:96]
+        device_b.memory[i] = sw(5, 2, 12'd12);                   i=i+1;
 
-        // ===== BLOCK 2 =====
-        dev1_memory[i] = lui(8, TEST_PT_2[31:12]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_2[11:0]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 0);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        // Clear RX buffer (acknowledge block consumed)
+        device_b.memory[i] = sw(0, 10, 12'd20);                  i=i+1;  // write to RX_CLEAR
 
-        dev1_memory[i] = lui(8, TEST_PT_2[63:44]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_2[43:32]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 1);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        // Loop control
+        device_b.memory[i] = addi(2, 2, 16);                     i=i+1;  // x2 += 16 (next block)
+        device_b.memory[i] = addi(4, 4, -1);                     i=i+1;  // x4 -= 1
+        device_b.memory[i] = bne(4, 0, -13'd168);                i=i+1;  // → poll (addr 0x10)
 
-        dev1_memory[i] = lui(8, TEST_PT_2[95:76]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_2[75:64]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 2);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        // Done: write completion flag
+        device_b.memory[i] = addi(6, 0, 1);                      i=i+1;  // x6 = 1
+        device_b.memory[i] = sw(6, 0, 12'h304);                  i=i+1;  // mem[0x304] = 1
 
-        dev1_memory[i] = lui(8, TEST_PT_2[127:108]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_2[107:96]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 3);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        // Halt (infinite loop)
+        device_b.memory[i] = jal(0, 21'd0);                      i=i+1;
 
-        // Reload key
-        dev1_memory[i] = lui(8, AES_KEY[31:12]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[11:0]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 0);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
-        dev1_memory[i] = lui(8, AES_KEY[63:44]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[43:32]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 1);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
-        dev1_memory[i] = lui(8, AES_KEY[95:76]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[75:64]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 2);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
-        dev1_memory[i] = lui(8, AES_KEY[127:108]); i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[107:96]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 3);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
+        $display("Device B firmware: %0d instructions", i);
 
-        dev1_memory[i] = aes_start(0, 0, 0);      i=i+1;
-        dev1_memory[i] = aes_status(10, 0, 0);    i=i+1;
-        dev1_memory[i] = beq(10, 0, -13'd4);      i=i+1;
-        dev1_memory[i] = addi(11, 0, 200);        i=i+1;
-        dev1_memory[i] = addi(11, 11, -1);        i=i+1;
-        dev1_memory[i] = bne(11, 0, -13'd4);      i=i+1;
+        // Store AES key at 0x200 (same key as Device A)
+        device_b.memory['h200 >> 2] = AES_KEY[31:0];
+        device_b.memory['h204 >> 2] = AES_KEY[63:32];
+        device_b.memory['h208 >> 2] = AES_KEY[95:64];
+        device_b.memory['h20C >> 2] = AES_KEY[127:96];
 
-        // ===== BLOCK 3 =====
-        dev1_memory[i] = lui(8, TEST_PT_3[31:12]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_3[11:0]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 0);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
+        // Store block count at 0x300
+        device_b.memory['h300 >> 2] = NUM_BLOCKS;
 
-        dev1_memory[i] = lui(8, TEST_PT_3[63:44]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_3[43:32]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 1);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
-
-        dev1_memory[i] = lui(8, TEST_PT_3[95:76]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_3[75:64]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 2);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
-
-        dev1_memory[i] = lui(8, TEST_PT_3[127:108]); i=i+1;
-        dev1_memory[i] = ori(8, 8, TEST_PT_3[107:96]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 3);           i=i+1;
-        dev1_memory[i] = aes_load_pt(0, 7, 8);    i=i+1;
-
-        // Reload key
-        dev1_memory[i] = lui(8, AES_KEY[31:12]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[11:0]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 0);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
-        dev1_memory[i] = lui(8, AES_KEY[63:44]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[43:32]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 1);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
-        dev1_memory[i] = lui(8, AES_KEY[95:76]);  i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[75:64]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 2);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
-        dev1_memory[i] = lui(8, AES_KEY[127:108]); i=i+1;
-        dev1_memory[i] = ori(8, 8, AES_KEY[107:96]); i=i+1;
-        dev1_memory[i] = addi(7, 0, 3);           i=i+1;
-        dev1_memory[i] = aes_load_key(0, 7, 8);   i=i+1;
-
-        dev1_memory[i] = aes_start(0, 0, 0);      i=i+1;
-        dev1_memory[i] = aes_status(10, 0, 0);    i=i+1;
-        dev1_memory[i] = beq(10, 0, -13'd4);      i=i+1;
-        dev1_memory[i] = addi(11, 0, 200);        i=i+1;
-        dev1_memory[i] = addi(11, 11, -1);        i=i+1;
-        dev1_memory[i] = bne(11, 0, -13'd4);      i=i+1;
-
-        // Done - infinite loop
-        dev1_memory[i] = jal(0, 21'd0);           i=i+1;
-
-        $display("Firmware loaded: %0d instructions", i);
-        $display("Image data: %0d blocks (%0d bytes)", NUM_TEST_BLOCKS, NUM_TEST_BLOCKS * 16);
         $display("");
 
-        // Release reset
+        //=====================================================
+        // Release reset and run
+        //=====================================================
         #(CLK_PERIOD * 10);
         resetn = 1;
-        $display("Reset released, PicoRV32 starting...");
+        $display("Reset released, both CPUs starting...");
+        $display("Processing %0d blocks...", NUM_BLOCKS);
         $display("");
 
-        // Wait for all blocks to be processed
-        $display("Waiting for encryption and SPI transfer...");
-
-        // Monitor progress
+        //=====================================================
+        // Wait for completion
+        //=====================================================
         fork
-            // Progress monitor
+            // Thread 1: Progress monitor
             begin
-                while (blocks_decrypted < NUM_TEST_BLOCKS && cycle_count < TIMEOUT_CYCLES) begin
+                while (device_b.memory['h304 >> 2] !== 32'd1 && cycle_count < TIMEOUT_CYCLES) begin
                     @(posedge clk);
                     cycle_count = cycle_count + 1;
 
-                    if (cycle_count % 10000 == 0)
-                        $display("  Cycle %0d: Received=%0d, Decrypted=%0d",
-                                 cycle_count, blocks_received, blocks_decrypted);
+                    // Progress report: at 10%, 20%, ... or every 50K cycles
+                    if (NUM_BLOCKS >= 20) begin
+                        if (blocks_sent > 0 && blocks_sent % (NUM_BLOCKS / 10) == 0
+                            && blocks_sent != NUM_BLOCKS) begin
+                            // Check if we just hit a 10% boundary
+                            if (blocks_sent == (blocks_sent / (NUM_BLOCKS/10)) * (NUM_BLOCKS/10))
+                                ; // handled by SPI counter thread
+                        end
+                    end
+                    if (cycle_count % 50000 == 0)
+                        $display("  [%0dk cycles] %0d/%0d blocks sent",
+                                 cycle_count / 1000, blocks_sent, NUM_BLOCKS);
                 end
             end
 
-            // Encryption counter (monitor SPI activity)
+            // Thread 2: Count SPI transfers from Device A
             begin
-                @(posedge resetn);
+                wait(resetn == 1);
                 forever begin
-                    @(negedge spi_cs_n);  // SPI transfer started
-                    @(posedge spi_cs_n);  // SPI transfer ended
-                    blocks_encrypted = blocks_encrypted + 1;
-                    $display("  [TX] Block %0d encrypted and transmitted", blocks_encrypted);
+                    @(negedge spi_cs_n);
+                    blocks_sent = blocks_sent + 1;
+                    @(posedge spi_cs_n);
+
+                    // Progress display
+                    if (NUM_BLOCKS <= 16) begin
+                        // Small image: show each block
+                        $display("  [SPI] Block %0d/%0d transferred (cycle %0d)",
+                                 blocks_sent, NUM_BLOCKS, cycle_count);
+                    end else if (blocks_sent % (NUM_BLOCKS / 10) == 0 || blocks_sent == NUM_BLOCKS) begin
+                        // Large image: show every 10%
+                        $display("  [SPI] Progress: %0d/%0d blocks (%0d%%) at cycle %0d",
+                                 blocks_sent, NUM_BLOCKS,
+                                 blocks_sent * 100 / NUM_BLOCKS, cycle_count);
+                    end
                 end
             end
         join_any
         disable fork;
 
-        #(CLK_PERIOD * 1000);  // Extra time for last decryption
-
-        $display("");
-        $display("================================================================");
-        $display("  Results");
-        $display("================================================================");
-        $display("Blocks encrypted: %0d", blocks_encrypted);
-        $display("Blocks received:  %0d", blocks_received);
-        $display("Blocks decrypted: %0d", blocks_decrypted);
-        $display("");
+        // Extra time for final processing
+        #(CLK_PERIOD * 200);
 
         //=====================================================
         // Verify Results
         //=====================================================
+        $display("");
+        $display("================================================================");
+        $display("  Results");
+        $display("================================================================");
+        $display("Blocks sent via SPI:  %0d / %0d", blocks_sent, NUM_BLOCKS);
+        $display("Completion flag:      %0d", device_b.memory['h304 >> 2]);
+        $display("Total cycles:         %0d", cycle_count);
+        $display("Throughput:           %0d cycles/block", cycle_count / (NUM_BLOCKS > 0 ? NUM_BLOCKS : 1));
+        $display("");
+
+        // Word-by-word comparison: Device A input vs Device B output
         $display("Verifying decrypted data...");
         errors = 0;
 
-        for (i = 0; i < NUM_TEST_BLOCKS; i = i + 1) begin
-            $display("Block %0d:", i);
-            $display("  Original:  %h", original_image[i]);
-            $display("  Decrypted: %h", dev2_memory[i]);
-
-            if (original_image[i] !== dev2_memory[i]) begin
-                $display("  STATUS: MISMATCH!");
+        for (i = 0; i < NUM_BLOCKS * 4; i = i + 1) begin
+            if (device_a.memory['h400/4 + i] !== device_b.memory['h400/4 + i]) begin
+                if (errors < 20) begin
+                    // Show first 20 mismatches with detail
+                    $display("  MISMATCH at word %0d (block %0d, word %0d):", i, i/4, i%4);
+                    $display("    Original:  %08h", device_a.memory['h400/4 + i]);
+                    $display("    Decrypted: %08h", device_b.memory['h400/4 + i]);
+                end
                 errors = errors + 1;
-            end else begin
-                $display("  STATUS: OK");
             end
         end
 
+        if (errors > 20)
+            $display("  ... and %0d more mismatches", errors - 20);
+
+        // Write decrypted output to hex file for Python reconstruction
+        fd = $fopen("decrypted_output.hex", "w");
+        for (i = 0; i < NUM_BLOCKS * 4; i = i + 1)
+            $fdisplay(fd, "%08h", device_b.memory['h400/4 + i]);
+        $fclose(fd);
+        $display("Written: decrypted_output.hex (%0d words)", NUM_BLOCKS * 4);
+
         $display("");
-        if (errors == 0 && blocks_decrypted == NUM_TEST_BLOCKS) begin
+        if (errors == 0 && blocks_sent == NUM_BLOCKS) begin
             $display("****************************************");
-            $display("*  SUCCESS! All blocks match!          *");
-            $display("*  Image transferred and decrypted     *");
-            $display("*  correctly over SPI!                 *");
+            $display("*  SUCCESS! All %0d blocks match!", NUM_BLOCKS);
+            $display("*");
+            $display("*  %0d bytes encrypted by CPU A,", NUM_BLOCKS * 16);
+            $display("*  transmitted over 8-lane SPI,");
+            $display("*  received and decrypted by CPU B.");
+            $display("*");
+            $display("*  Run: python3 hex_to_image.py");
+            $display("*  to reconstruct the image.");
             $display("****************************************");
         end else begin
-            $display("FAILED: %0d errors, %0d/%0d blocks decrypted",
-                     errors, blocks_decrypted, NUM_TEST_BLOCKS);
+            $display("FAILED: %0d word errors, %0d/%0d blocks sent",
+                     errors, blocks_sent, NUM_BLOCKS);
         end
 
         $display("");
-        $display("Simulation complete at cycle %0d", cycle_count);
         $finish;
     end
 
@@ -758,10 +575,17 @@ module tb_soc_image_transfer;
         #(CLK_PERIOD * TIMEOUT_CYCLES);
         $display("");
         $display("ERROR: Simulation timeout after %0d cycles!", TIMEOUT_CYCLES);
-        $display("Blocks encrypted: %0d", blocks_encrypted);
-        $display("Blocks received:  %0d", blocks_received);
-        $display("Blocks decrypted: %0d", blocks_decrypted);
+        $display("Blocks sent: %0d / %0d", blocks_sent, NUM_BLOCKS);
+        $display("Completion:  %0d", device_b.memory['h304 >> 2]);
         $finish;
+    end
+
+    //=========================================================
+    // Trap Monitor
+    //=========================================================
+    always @(posedge clk) begin
+        if (trap_a) $display("[%0t] WARNING: Device A trapped!", $time);
+        if (trap_b) $display("[%0t] WARNING: Device B trapped!", $time);
     end
 
 endmodule
