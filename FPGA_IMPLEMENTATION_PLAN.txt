@@ -1,0 +1,338 @@
+================================================================================
+FPGA IMPLEMENTATION PLAN - PicoRV32 + AES + SD Card
+Nexys 4 DDR (Xilinx Artix-7 XC7A100T)
+================================================================================
+
+--------------------------------------------------------------------------------
+CURRENT PROJECT STATE
+--------------------------------------------------------------------------------
+
+Already built:
+  - PicoRV32 CPU with AES-128 encrypt/decrypt co-processor (PCPI interface)
+  - 8-lane parallel SPI master (TX) and slave (RX)
+  - AES Encrypt: Aes-Code/ASMD_Encryption.v
+  - AES Decrypt: Aes-Code/Aes-Decryption/ASMD_Decryption.v
+  - Existing FPGA top: fpga/aes_soc_top.v  (targets Basys3, not Nexys 4 DDR)
+  - Existing XDC:      fpga/basys3_aes.xdc (needs to be replaced)
+
+Missing for FPGA deployment:
+  - SD card SPI controller
+  - Nexys 4 DDR XDC constraints file
+  - Phase 1 top-level pipeline FSM
+  - Phase 2 dual-CPU top-level
+
+
+--------------------------------------------------------------------------------
+PHASE 1: SD Card -> Encrypt -> Decrypt -> SD Card
+--------------------------------------------------------------------------------
+
+Goal:
+  Read an image stored on SD card, encrypt each 128-bit block with AES-128,
+  immediately decrypt it with the same key, then write the result back to the
+  SD card. This validates the full AES pipeline on hardware with real data.
+
+No CPU required for Phase 1 - pure hardware pipeline:
+
+  SD Card (MicroSD slot on Nexys 4 DDR)
+       |
+       |  SPI (SD card controller, ~400 kHz init, up to 25 MHz data)
+       v
+  [SD Card Reader FSM]  -- reads 512-byte sectors, outputs 128-bit blocks
+       |
+       |  128-bit plaintext blocks
+       v
+  [AES Encrypt Module]  -- hardcoded key (or key from switches/BRAM)
+       |
+       |  128-bit ciphertext
+       v
+  [AES Decrypt Module]  -- same key
+       |
+       |  128-bit recovered plaintext
+       v
+  [SD Card Writer FSM]  -- writes 512-byte sectors back
+       |
+  SD Card (same card, different sector offset)
+
+
+PHASE 1 - WHAT TO BUILD:
+
+  1. sd_card_controller.v
+       - SPI-based SD card init (CMD0, CMD8, ACMD41, CMD58)
+       - Block read  (CMD17 - read single 512-byte block)
+       - Block write (CMD24 - write single 512-byte block)
+       - State machine: IDLE -> INIT -> READ -> PROCESS -> WRITE -> DONE
+       - Nexys 4 DDR SD pins (see XDC section below)
+
+  2. aes_pipeline_top.v  (Phase 1 top-level)
+       - Instantiates: sd_card_controller + ASMD_Encryption + ASMD_Decryption
+       - Pipeline FSM:
+           * Read N blocks from SD (sectors 0..N-1)
+           * For each 128-bit chunk: load into AES enc, start, wait done
+           * Feed ciphertext into AES dec, start, wait done
+           * Accumulate 512-byte sector, write to SD (sectors 100..100+N-1)
+       - Status output: LEDs show INIT / READ / ENCRYPT / DECRYPT / WRITE / DONE
+
+  3. nexys4ddr_aes.xdc  (new constraints file)
+       - See XDC section below
+
+
+NEXYS 4 DDR PIN ASSIGNMENTS (XDC):
+
+  Clock:
+    clk          -> E3   (100 MHz onboard oscillator)
+
+  Reset:
+    resetn_btn   -> C12  (CPU_RESET button, active-low)
+
+  MicroSD Card SPI pins (onboard SD slot):
+    sd_sclk      -> B1   (SD_CLK)
+    sd_mosi      -> C1   (SD_CMD  / DI in SPI mode)
+    sd_miso      -> C2   (SD_DAT0 / DO in SPI mode)
+    sd_cs_n      -> D2   (SD_DAT3 / CS in SPI mode)
+    sd_detect    -> (optional) no detect pin on Nexys 4 DDR onboard slot
+
+  LEDs (16 total):
+    led[0]       -> H17  (status: INIT)
+    led[1]       -> K15  (status: READ)
+    led[2]       -> J13  (status: ENCRYPT)
+    led[3]       -> N14  (status: DECRYPT)
+    led[4]       -> R18  (status: WRITE)
+    led[5]       -> V17  (status: DONE)
+    led[15]      -> U14  (heartbeat / running)
+
+  Buttons:
+    btn_start    -> M18  (BTNC - center button, start pipeline)
+
+  IOSTANDARD: LVCMOS33 for all I/O
+
+
+PHASE 1 - BLOCK DIAGRAM:
+
+  +-----------+    128-bit    +-------------+    128-bit    +-------------+
+  | SD Reader | ------------> | AES Encrypt | ------------> | AES Decrypt |
+  |   FSM     |  (plaintext)  |  ASMD_Enc   |  (cipher)     |  ASMD_Dec   |
+  +-----------+               +-------------+               +-------------+
+       ^                                                           |
+       |                                                    128-bit (plaintext)
+       |                                                           v
+  [SD Card]  <------------------------------------------------ SD Writer FSM
+  MicroSD                                                    (write back)
+
+
+PHASE 1 - SD CARD IMAGE FORMAT:
+
+  Sector layout on SD card (raw, no filesystem needed):
+    Sector 0:      Metadata (image width, height, format)
+    Sectors 1-N:   Original image data (plaintext input)
+    Sectors 100+:  Output data (decrypted result, should match input)
+
+  Each 512-byte sector = four 128-bit AES blocks
+  AES key: hardcoded in RTL for Phase 1 (e.g., FIPS-197 test key)
+           0x000102030405060708090a0b0c0d0e0f
+
+
+PHASE 1 - SIMULATION PLAN:
+
+  Before synthesizing, simulate with:
+    iverilog -g2012 tb_phase1_pipeline.v \
+        sd_card_controller.v \
+        Aes-Code/ASMD_Encryption.v \
+        Aes-Code/Aes-Decryption/ASMD_Decryption.v \
+        [all AES sub-modules]
+    vvp tb_phase1_pipeline.vvp
+    gtkwave tb_phase1_pipeline.vcd
+
+  Testbench feeds raw hex data instead of real SD card,
+  checks that output matches input after enc->dec.
+
+
+PHASE 1 - VIVADO PROJECT SETUP:
+
+  1. Create new RTL project in Vivado
+  2. Add sources:
+       Aes-Code/ASMD_Encryption.v
+       Aes-Code/ControlUnit_Enryption.v
+       Aes-Code/Datapath_Encryption.v
+       Aes-Code/Key_expansion.v
+       Aes-Code/S_BOX.v
+       Aes-Code/mix_cols.v
+       Aes-Code/shift_rows.v
+       Aes-Code/Sub_Bytes.v
+       Aes-Code/Counter.v
+       Aes-Code/Register.v
+       Aes-Code/function_g.v
+       Aes-Code/Aes-Decryption/ASMD_Decryption.v
+       Aes-Code/Aes-Decryption/ControlUnit_Decryption.v
+       Aes-Code/Aes-Decryption/Datapath_Decryption.v
+       Aes-Code/Aes-Decryption/Key_expansion.v
+       Aes-Code/Aes-Decryption/Inv_Sub_Bytes.v
+       Aes-Code/Aes-Decryption/Inv_mix_cols.v
+       Aes-Code/Aes-Decryption/Inv_shift_rows.v
+       Aes-Code/Aes-Decryption/Counter.v
+       Aes-Code/Aes-Decryption/Register.v
+       Aes-Code/Aes-Decryption/S_BOX.v
+       Aes-Code/Aes-Decryption/inv_S_box.v
+       Aes-Code/Aes-Decryption/function_g.v
+       sd_card_controller.v   (new)
+       aes_pipeline_top.v     (new, Phase 1 top)
+  3. Add constraints: nexys4ddr_aes.xdc
+  4. Set top module: aes_pipeline_top
+  5. Target part: xc7a100tcsg324-1  (Nexys 4 DDR)
+  6. Run Synthesis -> Implementation -> Generate Bitstream
+  7. Program via USB-JTAG
+
+
+--------------------------------------------------------------------------------
+PHASE 2: Two PicoRV32 CPUs over SPI on ONE FPGA
+--------------------------------------------------------------------------------
+
+CAN IT FIT ON ONE FPGA?
+
+  Yes. The Nexys 4 DDR uses XC7A100T which has:
+    Slice LUTs:  63,400
+    Slice FFs:   126,800
+    BRAM (36K):  135
+    DSP48:       240
+
+  Estimated resource usage for dual-CPU system:
+    PicoRV32 CPU (each, with AES + SPI): ~7,000-9,000 LUTs
+    Two CPUs total:                      ~14,000-18,000 LUTs  (~28% of 63K)
+    SD card controller:                  ~500-800 LUTs
+    Glue logic / arbitration:            ~200-500 LUTs
+    TOTAL ESTIMATED:                     ~15,000-20,000 LUTs  (~25-32%)
+
+  Conclusion: Comfortably fits. You have ~3x headroom.
+
+
+PHASE 2 ARCHITECTURE:
+
+  +-------------------------------------------------------+
+  |              Nexys 4 DDR (XC7A100T)                   |
+  |                                                       |
+  |  CPU A                          CPU B                 |
+  |  PicoRV32                       PicoRV32              |
+  |  + AES Encrypt Co-proc          + AES Decrypt Co-proc |
+  |  + SPI Master (8-lane TX)  -->  + SPI Slave (8-lane RX)|
+  |  + SD Reader firmware           + SD Writer firmware  |
+  |       |                                  |            |
+  |       |                                  |            |
+  |  [BRAM A - firmware A]      [BRAM B - firmware B]     |
+  |       |                                  |            |
+  |       +-------> SD Controller <----------+            |
+  |                 (arbitrated)                          |
+  |                      |                                |
+  +----------------------|--------------------------- ----+
+                         |
+                    MicroSD Card
+              (CPU A reads sectors 1-N,
+               CPU B writes sectors 200-200+N)
+
+
+PHASE 2 SPI CONNECTION:
+
+  CPU A's SPI outputs connect DIRECTLY to CPU B's SPI inputs as internal wires.
+  No physical I/O pins needed. No board-level wiring required.
+
+    cpu_a.aes_spi_data[7:0]  -->  cpu_b_spi_slave.rx_data[7:0]
+    cpu_a.aes_spi_clk        -->  cpu_b_spi_slave.spi_clk
+    cpu_a.aes_spi_cs_n       -->  cpu_b_spi_slave.spi_cs_n
+
+  You already have spi_slave_8lane.v and spi_rx_buffer.v for the receive side.
+
+
+PHASE 2 FIRMWARE:
+
+  CPU A firmware (aes_sender.c / aes_sender.S):
+    1. Read 512-byte sector from SD card into local BRAM
+    2. For each 128-bit block:
+         a. Load plaintext via AES_LOAD_PT custom instruction
+         b. Load key via AES_LOAD_KEY custom instruction
+         c. AES_START to begin encryption
+         d. Poll AES_STATUS until done
+         e. Read ciphertext via AES_READ custom instruction
+         f. (8-lane SPI auto-fires after encryption - already implemented)
+    3. Repeat for all blocks in image
+    4. Signal completion (write to memory-mapped GPIO)
+
+  CPU B firmware (aes_receiver.c / aes_receiver.S):
+    1. Wait for SPI data to arrive (poll rx_buffer_valid flag)
+    2. For each received 128-bit ciphertext block:
+         a. Load into AES_DEC co-processor
+         b. Start decryption
+         c. Wait for completion
+         d. Store decrypted plaintext to local BRAM
+    3. When 512 bytes accumulated, write sector to SD card
+    4. Repeat until all blocks received
+    5. Signal completion (LED)
+
+
+PHASE 2 MEMORY MAP (each CPU):
+
+  0x00000000 - 0x00003FFF  : BRAM (firmware + stack + data buffer)
+                             16KB = 4K x 32-bit words
+  0x10000000               : GPIO / status register (memory-mapped)
+  AES co-processor         : accessed via custom PCPI instructions
+
+
+PHASE 2 - WHAT TO BUILD:
+
+  1. Update aes_soc_device.v to be a complete CPU subsystem:
+       - PicoRV32 + AES enc/dec + BRAM + memory controller
+       - GPIO output port (for signaling between CPUs or to top level)
+
+  2. phase2_dual_cpu_top.v:
+       - Instantiate cpu_a (ENABLE_AES=1, ENABLE_AES_DEC=0)
+       - Instantiate cpu_b (ENABLE_AES=0, ENABLE_AES_DEC=1)
+       - Wire cpu_a SPI outputs to cpu_b SPI slave inputs
+       - Instantiate sd_card_controller (shared, arbitrated)
+       - SD arbiter: cpu_a gets priority for reads, cpu_b for writes
+       - Status LEDs: show both CPUs' states
+
+  3. Firmware for CPU A: reads SD, encrypts, sends via SPI
+  4. Firmware for CPU B: receives SPI, decrypts, writes SD
+
+  5. nexys4ddr_dual_cpu.xdc:
+       - Same SD card pins
+       - LED assignments for dual-CPU status
+       - Button for start/reset
+
+
+--------------------------------------------------------------------------------
+RECOMMENDED BUILD ORDER
+--------------------------------------------------------------------------------
+
+Step 1:  Write nexys4ddr_aes.xdc  (new XDC for Nexys 4 DDR)
+Step 2:  Write sd_card_controller.v  (SPI SD card, init + read + write)
+Step 3:  Write tb_sd_card.v  (simulate SD controller with model)
+Step 4:  Write aes_pipeline_top.v  (Phase 1 top, glue FSM)
+Step 5:  Simulate Phase 1 end-to-end
+Step 6:  Synthesize Phase 1 in Vivado, check timing and area
+Step 7:  Program FPGA, test with real SD card and image
+Step 8:  Write CPU A firmware (aes_sender)
+Step 9:  Write CPU B firmware (aes_receiver)
+Step 10: Write phase2_dual_cpu_top.v
+Step 11: Simulate Phase 2
+Step 12: Synthesize Phase 2, program FPGA, full end-to-end test
+
+
+--------------------------------------------------------------------------------
+KEY NOTES
+--------------------------------------------------------------------------------
+
+- Nexys 4 DDR MicroSD slot is SPI mode, not SDIO mode
+- SD card must be formatted with raw sectors (or FAT32 with known offsets)
+- AES key can be loaded from DIP switches (16 switches = only 16 bits visible
+  at a time, need 128 bits total) or hardcoded in RTL for simplicity
+- For Phase 1, no RISC-V toolchain needed (pure RTL pipeline)
+- For Phase 2, RISC-V toolchain needed for firmware compilation
+- Existing FIPS-197 test vector validates AES correctness:
+    Plaintext:  0x00112233445566778899aabbccddeeff
+    Key:        0x000102030405060708090a0b0c0d0e0f
+    Ciphertext: 0x69c4e0d86a7b0430d8cdb78070b4c55a
+- SPI clock for SD card: start at 400 kHz (init), switch to 25 MHz (data)
+  At 100 MHz FPGA clock: 400 kHz divider = 125, 25 MHz divider = 2
+
+
+================================================================================
+END OF PLAN
+================================================================================
