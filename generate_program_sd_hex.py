@@ -283,12 +283,13 @@ def emit_load_key_once(builder):
 
 
 def emit_zero_buffer(builder):
+    loop_label = f"zero_buffer_loop_{len(builder.items)}"
     builder.emit(addi(29, 7, 0))
     load_abs(builder, 30, BUF_BASE + 512)
-    builder.label("zero_buffer_loop")
+    builder.label(loop_label)
     builder.emit(sw(0, 29, 0))
     builder.emit(addi(29, 29, 4))
-    builder.branch_bne(29, 30, "zero_buffer_loop")
+    builder.branch_bne(29, 30, loop_label)
 
 
 def generate_program():
@@ -344,11 +345,11 @@ def generate_program():
     store_stage(p, DISP_IDLE)
     store_stage(p, GPIOF_RUNNING | DISP_PRELOAD)
     emit_zero_buffer(p)
-
     emit_copy4(p, 8, 7)
     p.emit(addi(29, 0, META_SECTOR))
     p.jump("sd_write", rd=1)
 
+    emit_zero_buffer(p)
     emit_copy4(p, 9, 7)
     p.emit(addi(29, 0, KEY_SECTOR))
     p.jump("sd_write", rd=1)
@@ -357,6 +358,7 @@ def generate_program():
     p.emit(addi(29, 0, PLAIN_BASE_SECTOR))
     p.emit(addi(11, 0, IMAGE_FILE_BLOCKS))
     p.label("preload_loop")
+    emit_zero_buffer(p)
     emit_copy4(p, 8, 7)
     p.jump("sd_write", rd=1)
     p.emit(addi(8, 8, 16))
@@ -398,6 +400,7 @@ def generate_program():
     p.emit(aes_read(28, 23))
 
     store_stage(p, GPIOF_RUNNING | GPIOF_PRELOAD_DONE | DISP_WRITE_CT)
+    emit_zero_buffer(p)
     p.emit(sw(25, 7, 0))
     p.emit(sw(26, 7, 4))
     p.emit(sw(27, 7, 8))
@@ -451,6 +454,7 @@ def generate_program():
     p.label("dec_match")
 
     store_stage(p, GPIOF_RUNNING | GPIOF_PRELOAD_DONE | DISP_WRITE_DEC)
+    emit_zero_buffer(p)
     p.emit(sw(25, 7, 0))
     p.emit(sw(26, 7, 4))
     p.emit(sw(27, 7, 8))
@@ -463,6 +467,31 @@ def generate_program():
     p.emit(addi(13, 13, 1))
     p.emit(addi(11, 11, -1))
     p.branch_bne(11, 0, "block_loop")
+
+    store_stage(p, GPIOF_RUNNING | GPIOF_PRELOAD_DONE | DISP_PRELOAD)
+    load_abs(p, 8, IMAGE_BASE)
+    emit_zero_buffer(p)
+    emit_copy4(p, 8, 7)
+    p.emit(addi(29, 0, META_SECTOR))
+    p.jump("sd_write", rd=1)
+
+    emit_zero_buffer(p)
+    emit_copy4(p, 9, 7)
+    p.emit(addi(29, 0, KEY_SECTOR))
+    p.jump("sd_write", rd=1)
+
+    p.emit(addi(8, 8, 16))
+    p.emit(addi(10, 0, PLAIN_BASE_SECTOR))
+    p.emit(addi(11, 0, IMAGE_FILE_BLOCKS))
+    p.label("restore_plain_loop")
+    emit_zero_buffer(p)
+    emit_copy4(p, 8, 7)
+    p.emit(addi(29, 10, 0))
+    p.jump("sd_write", rd=1)
+    p.emit(addi(8, 8, 16))
+    p.emit(addi(10, 10, 1))
+    p.emit(addi(11, 11, -1))
+    p.branch_bne(11, 0, "restore_plain_loop")
 
     p.emit(addi(24, 0, GPIOF_PRELOAD_DONE | GPIOF_RUN_DONE))
     p.branch_beq(14, 0, "skip_ct_ok")

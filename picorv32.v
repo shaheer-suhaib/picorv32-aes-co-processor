@@ -3206,16 +3206,18 @@ module pcpi_aes #(
 	);
 
 	// FSM states
-	localparam IDLE         = 3'd0;
-	localparam EXECUTE      = 3'd1;
-	localparam START_AES    = 3'd2;
-	localparam WAIT_AES     = 3'd3;
-	localparam SPI_CS_SETUP = 3'd4;  // CS setup time before first clock
-	localparam SPI_SEND     = 3'd5;
-	localparam SPI_CLK_LOW  = 3'd6;
-	localparam COMPLETE     = 3'd7;
+	localparam IDLE         = 4'd0;
+	localparam EXECUTE      = 4'd1;
+	localparam START_AES    = 4'd2;
+	localparam WAIT_AES     = 4'd3;
+	localparam SPI_CS_SETUP = 4'd4;  // CS setup time before first byte
+	localparam SPI_LOAD     = 4'd5;  // Present byte while clock is low
+	localparam SPI_CLK_HIGH = 4'd6;  // Raise strobe after data is stable
+	localparam SPI_CLK_LOW  = 4'd7;
+	localparam COMPLETE     = 4'd8;
+	localparam RESPOND      = 4'd9;
 
-	reg [2:0] state;
+	reg [3:0] state;
 	reg [1:0] word_index;
 
 	always @(posedge clk) begin
@@ -3265,7 +3267,7 @@ module pcpi_aes #(
 					pcpi_wr    <= 1;
 					pcpi_ready <= 1;
 					pcpi_wait  <= 0;
-					state      <= IDLE;
+					state      <= RESPOND;
 				end
 				else if (instr_load_key) begin
 					case (word_index)
@@ -3278,7 +3280,7 @@ module pcpi_aes #(
 					pcpi_wr    <= 1;
 					pcpi_ready <= 1;
 					pcpi_wait  <= 0;
-					state      <= IDLE;
+					state      <= RESPOND;
 				end
 				else if (instr_start) begin
 					aes_running     <= 1;
@@ -3295,14 +3297,14 @@ module pcpi_aes #(
 					pcpi_wr    <= 1;
 					pcpi_ready <= 1;
 					pcpi_wait  <= 0;
-					state      <= IDLE;
+					state      <= RESPOND;
 				end
 				else if (instr_status) begin
 					pcpi_rd    <= aes_running ? 32'd0 : 32'd1;
 					pcpi_wr    <= 1;
 					pcpi_ready <= 1;
 					pcpi_wait  <= 0;
-					state      <= IDLE;
+					state      <= RESPOND;
 				end
 			end
 
@@ -3318,24 +3320,27 @@ module pcpi_aes #(
 					spi_byte_index <= 0;
 					spi_active     <= 1;          // Mark SPI as active
 					aes_spi_cs_n   <= 0;          // Assert chip select (active low)
+					aes_spi_clk    <= 0;
 					aes_running    <= 0;
 					state          <= SPI_CS_SETUP;  // CS setup time
 				end
 			end
 
 			SPI_CS_SETUP: begin
-				// CS has been low for one cycle, now output first byte with clock
-				aes_spi_data <= RESULT[7:0];  // First byte (LSB)
-				aes_spi_clk  <= 1;            // Strobe high
-				state        <= SPI_CLK_LOW;
+				// Give chip select one full cycle before presenting the first byte.
+				state <= SPI_LOAD;
 			end
 
-			SPI_SEND: begin
-				// 8-lane parallel SPI: output one byte per clock pulse
-				// Data is directly muxed from RESULT register
+			SPI_LOAD: begin
+				// Present the next byte while the strobe clock remains low.
 				aes_spi_data <= RESULT[(spi_byte_index*8) +: 8];
-				aes_spi_clk  <= 1;  // Strobe high
-				state        <= SPI_CLK_LOW;
+				aes_spi_clk  <= 0;
+				state        <= SPI_CLK_HIGH;
+			end
+
+			SPI_CLK_HIGH: begin
+				aes_spi_clk <= 1;
+				state       <= SPI_CLK_LOW;
 			end
 
 			SPI_CLK_LOW: begin
@@ -3343,7 +3348,7 @@ module pcpi_aes #(
 				aes_spi_clk <= 0;
 				if (spi_byte_index < 15) begin
 					spi_byte_index <= spi_byte_index + 1'b1;
-					state          <= SPI_SEND;
+					state          <= SPI_LOAD;
 				end else begin
 					// All 16 bytes sent
 					spi_active   <= 0;
@@ -3358,7 +3363,15 @@ module pcpi_aes #(
 				pcpi_wr    <= 1;
 				pcpi_ready <= 1;
 				pcpi_wait  <= 0;
-				state      <= IDLE;
+				state      <= RESPOND;
+			end
+
+			RESPOND: begin
+				pcpi_wr    <= 1;
+				pcpi_ready <= 1;
+				pcpi_wait  <= 0;
+				if (!pcpi_valid)
+					state <= IDLE;
 			end
 
 			default: state <= IDLE;
@@ -3405,8 +3418,6 @@ module pcpi_aes_dec (
 	wire dec_done;
 	wire [127:0] Dout;
 
-	reg dec_local_reset;
-
 	// Instantiate AES decryption core
 	ASMD_Decryption aes_dec_core (
 		.done              (dec_done),
@@ -3415,14 +3426,16 @@ module pcpi_aes_dec (
 		.key_in            (KEY),
 		.decrypt           (dec_start_pulse),
 		.clock             (clk),
-		.reset             (dec_local_reset)
+		.reset             (!resetn)
 	);
 
 	// FSM states
-	localparam IDLE       = 3'd0;
-	localparam EXECUTE    = 3'd1;
-	localparam START_DEC  = 3'd2;
-	localparam WAIT_DEC   = 3'd3;
+	localparam IDLE        = 3'd0;
+	localparam EXECUTE     = 3'd1;
+	localparam START_DEC_0 = 3'd2;
+	localparam WAIT_DEC    = 3'd3;
+	localparam START_DEC_1 = 3'd4;
+	localparam RESPOND     = 3'd5;
 
 	reg [2:0] state;
 	reg [1:0] word_index;
@@ -3439,13 +3452,11 @@ module pcpi_aes_dec (
 			RESULT        <= 128'b0;
 			dec_running   <= 0;
 			dec_start_pulse <= 0;
-			dec_local_reset <= 0;
 		end else begin
 			// Default: clear single-cycle signals
 			pcpi_wr         <= 0;
 			pcpi_ready      <= 0;
 			dec_start_pulse <= 0;
-			dec_local_reset <= 0;
 
 			case (state)
 			IDLE: begin
@@ -3470,7 +3481,7 @@ module pcpi_aes_dec (
 					pcpi_wr    <= 1;
 					pcpi_ready <= 1;
 					pcpi_wait  <= 0;
-					state      <= IDLE;
+					state      <= RESPOND;
 				end
 				else if (instr_load_key) begin
 					// Load key word: KEY[index] = rs2
@@ -3484,14 +3495,14 @@ module pcpi_aes_dec (
 					pcpi_wr    <= 1;
 					pcpi_ready <= 1;
 					pcpi_wait  <= 0;
-					state      <= IDLE;
+					state      <= RESPOND;
 				end
 				else if (instr_start) begin
-					// Prepare AES decryption core: assert local reset for one full cycle,
-					// then kick decryption in START_DEC state.
+					// Start the next decrypt operation from the core's normal done state.
+					// The direct multi-block flow relies on decrypt driving S6 -> S_EXPAND
+					// without forcing an extra local reset between blocks.
 					dec_running    <= 1;
-					state          <= START_DEC;
-					dec_local_reset <= 1;
+					state          <= START_DEC_0;
 				end
 				else if (instr_read) begin
 					// Read result word
@@ -3504,7 +3515,7 @@ module pcpi_aes_dec (
 					pcpi_wr    <= 1;
 					pcpi_ready <= 1;
 					pcpi_wait  <= 0;
-					state      <= IDLE;
+					state      <= RESPOND;
 				end
 				else if (instr_status) begin
 					// Return status: 1 = done/idle, 0 = busy
@@ -3512,12 +3523,18 @@ module pcpi_aes_dec (
 					pcpi_wr    <= 1;
 					pcpi_ready <= 1;
 					pcpi_wait  <= 0;
-					state      <= IDLE;
+					state      <= RESPOND;
 				end
 			end
 
-			START_DEC: begin
-				// Release reset and issue one-cycle start pulse after reset completed.
+			START_DEC_0: begin
+				// ASMD_Decryption requires a two-cycle decrypt pulse for
+				// reliable back-to-back block processing.
+				dec_start_pulse <= 1;
+				state           <= START_DEC_1;
+			end
+
+			START_DEC_1: begin
 				dec_start_pulse <= 1;
 				state           <= WAIT_DEC;
 			end
@@ -3530,8 +3547,16 @@ module pcpi_aes_dec (
 					pcpi_wr       <= 1;
 					pcpi_ready    <= 1;
 					pcpi_wait     <= 0;
-					state         <= IDLE;
+					state         <= RESPOND;
 				end
+			end
+
+			RESPOND: begin
+				pcpi_wr    <= 1;
+				pcpi_ready <= 1;
+				pcpi_wait  <= 0;
+				if (!pcpi_valid)
+					state <= IDLE;
 			end
 
 			default: state <= IDLE;

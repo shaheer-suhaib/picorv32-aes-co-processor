@@ -134,7 +134,8 @@ localparam [4:0]
     ST_WR_DRESP    = 24,
     ST_WR_BUSY     = 25,
     ST_ERROR       = 26,
-    ST_INIT_GAP    = 27;
+    ST_INIT_GAP    = 27,
+    ST_POST_GAP    = 28;
 
 reg [4:0]  state      = ST_PWRUP;
 reg [4:0]  last_state = ST_PWRUP;   // captures state before ST_ERROR
@@ -150,6 +151,7 @@ reg [15:0] poll_cnt   = 0;
 reg        token_sent = 0;
 reg [4:0]  init_next_state = ST_CMD0;
 reg [3:0]  cmd0_retry = 0;
+reg [1:0]  post_gap_action = 0;
 
 // ------------------------------------------------------------------
 // Main FSM
@@ -178,6 +180,7 @@ always @(posedge clk) begin
         token_sent <= 0;
         init_next_state <= ST_CMD0;
         cmd0_retry <= 0;
+        post_gap_action <= 0;
     end else begin
         case (state)
 
@@ -235,6 +238,23 @@ always @(posedge clk) begin
                 spi_req <= 1;
                 if (spi_done) begin
                     state <= init_next_state;
+                end
+            end
+        end
+
+        ST_POST_GAP: begin
+            sd_cs <= 1;
+            if (!spi_busy && !spi_req) begin
+                spi_tx  = 8'hFF;
+                spi_req <= 1;
+                if (spi_done) begin
+                    if (post_gap_action == 2'd1)
+                        rd_done <= 1;
+                    else if (post_gap_action == 2'd2)
+                        wr_done <= 1;
+                    post_gap_action <= 0;
+                    busy     <= 0;
+                    state    <= ST_READY;
                 end
             end
         end
@@ -537,11 +557,9 @@ always @(posedge clk) begin
                 if (spi_done) begin
                     byte_cnt <= byte_cnt + 1;
                     if (byte_cnt == 1) begin
-                        sd_cs    <= 1;
-                        rd_done  <= 1;
-                        busy     <= 0;
                         byte_cnt <= 0;
-                        state    <= ST_READY;
+                        post_gap_action <= 2'd1;
+                        state    <= ST_POST_GAP;
                     end
                 end
             end
@@ -665,11 +683,9 @@ always @(posedge clk) begin
                 spi_req <= 1;
                 if (spi_done) begin
                     if (spi_rx_byte == 8'hFF) begin
-                        // Card is no longer busy - write complete
-                        sd_cs   <= 1;
-                        wr_done <= 1;
-                        busy    <= 0;
-                        state   <= ST_READY;
+                        // Card is no longer busy - add one extra idle byte before finishing
+                        post_gap_action <= 2'd2;
+                        state   <= ST_POST_GAP;
                     end else begin
                         // Still busy (0x00) - keep polling with large timeout
                         poll_cnt <= poll_cnt + 1;

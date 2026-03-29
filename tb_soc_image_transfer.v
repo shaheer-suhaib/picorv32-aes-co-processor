@@ -92,6 +92,7 @@ module tb_soc_image_transfer;
     reg  [127:0] dec_ciphertext;
     reg  [127:0] dec_key;
     reg          dec_start;
+    reg  [1:0]   dec_start_count;
     wire [127:0] dec_plaintext;
     wire         dec_done;
 
@@ -243,11 +244,16 @@ module tb_soc_image_transfer;
         if (!resetn) begin
             rx_state <= RX_IDLE;
             dec_start <= 0;
+            dec_start_count <= 0;
             dec_ciphertext <= 0;
             dec_key <= AES_KEY;
             dev2_block_count <= 0;
         end else begin
             dec_start <= 0;
+            if (dec_start_count != 0) begin
+                dec_start <= 1;
+                dec_start_count <= dec_start_count - 1'b1;
+            end
 
             case (rx_state)
                 RX_IDLE: begin
@@ -260,8 +266,9 @@ module tb_soc_image_transfer;
                 end
 
                 RX_DECRYPT_START: begin
-                    // Start decryption - hold for 2 cycles for proper capture
+                    // Hold decrypt high for two full cycles.
                     dec_start <= 1;
+                    dec_start_count <= 1;
                     rx_state <= RX_DECRYPT_WAIT;
                 end
 

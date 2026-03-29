@@ -8,7 +8,9 @@
  * - Little-endian byte order (LSB first)
  */
 
-module spi_slave_8lane (
+module spi_slave_8lane #(
+    parameter SAME_CLK_DOMAIN = 1'b0
+) (
     // System interface
     input  wire        clk,           // System clock
     input  wire        resetn,        // Active-low reset
@@ -54,6 +56,11 @@ module spi_slave_8lane (
     wire spi_cs_n_sync;
     wire [7:0] spi_data_sync;
 
+    // Direct sampling path for loopback/same-clock simulations
+    reg spi_clk_direct_d;
+    reg spi_cs_n_direct;
+    reg [7:0] spi_data_direct;
+
     // Synchronization logic
     always @(posedge clk or negedge resetn) begin
         if (!resetn) begin
@@ -64,6 +71,9 @@ module spi_slave_8lane (
             spi_cs_n_sync2 <= 1'b1;
             spi_data_sync1 <= 8'b0;
             spi_data_sync2 <= 8'b0;
+            spi_clk_direct_d <= 1'b0;
+            spi_cs_n_direct <= 1'b1;
+            spi_data_direct <= 8'b0;
         end else begin
             // SPI clock synchronizer (3-stage for edge detection)
             spi_clk_sync1 <= spi_clk_in;
@@ -77,15 +87,22 @@ module spi_slave_8lane (
             // Data synchronizer
             spi_data_sync1 <= spi_data_in;
             spi_data_sync2 <= spi_data_sync1;
+
+            // Same-clock direct samples
+            spi_clk_direct_d <= spi_clk_in;
+            spi_cs_n_direct  <= spi_cs_n_in;
+            spi_data_direct  <= spi_data_in;
         end
     end
 
     // Rising edge detection: was low, now high
-    assign spi_clk_rising_edge = (spi_clk_sync2 == 1'b1) && (spi_clk_sync3 == 1'b0);
+    assign spi_clk_rising_edge = SAME_CLK_DOMAIN ?
+                                 (spi_clk_in && !spi_clk_direct_d) :
+                                 ((spi_clk_sync2 == 1'b1) && (spi_clk_sync3 == 1'b0));
 
-    // Synchronized outputs
-    assign spi_cs_n_sync = spi_cs_n_sync2;
-    assign spi_data_sync = spi_data_sync2;
+    // Sampled outputs
+    assign spi_cs_n_sync = SAME_CLK_DOMAIN ? spi_cs_n_direct : spi_cs_n_sync2;
+    assign spi_data_sync = SAME_CLK_DOMAIN ? spi_data_direct : spi_data_sync2;
 
     // =========================================================================
     // Byte Counter - counts 0 to 15 (16 bytes = 128 bits)
@@ -180,9 +197,16 @@ module spi_slave_8lane (
 
             case (state)
                 STATE_IDLE: begin
-                    // Reset counter when idle
-                    byte_count <= 4'd0;
-                    shift_reg  <= 128'd0;
+                    if (SAME_CLK_DOMAIN && !spi_cs_n_sync && spi_clk_rising_edge) begin
+                        // In same-clock loopback mode, the first byte edge can
+                        // arrive before the FSM has transitioned into RECEIVING.
+                        shift_reg  <= {spi_data_sync, 120'd0};
+                        byte_count <= 4'd1;
+                    end else begin
+                        // Reset counter when idle
+                        byte_count <= 4'd0;
+                        shift_reg  <= 128'd0;
+                    end
                 end
 
                 STATE_RECEIVING: begin

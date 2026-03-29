@@ -9,8 +9,19 @@ Usage:
 """
 import math
 import os
+from pathlib import Path
 import struct
 import sys
+
+
+FIXED_KEY_BYTES = bytes([
+    0x0F, 0x0E, 0x0D, 0x0C,
+    0x0B, 0x0A, 0x09, 0x08,
+    0x07, 0x06, 0x05, 0x04,
+    0x03, 0x02, 0x01, 0x00,
+])
+
+EXPECTED_DATA_BASE_SECTOR = 20
 
 
 def open_raw_device(path, mode):
@@ -42,6 +53,45 @@ def parse_args(argv):
 
 def fmt_bytes(data):
     return " ".join(f"{b:02X}" for b in data)
+
+
+def first_mismatch(lhs, rhs):
+    limit = min(len(lhs), len(rhs))
+    for idx in range(limit):
+        if lhs[idx] != rhs[idx]:
+            return idx, lhs[idx], rhs[idx]
+    if len(lhs) != len(rhs):
+        lhs_byte = lhs[limit] if limit < len(lhs) else None
+        rhs_byte = rhs[limit] if limit < len(rhs) else None
+        return limit, lhs_byte, rhs_byte
+    return None
+
+
+def load_expected_phase1_image():
+    image_hex_path = Path(__file__).with_name("image_input.hex")
+    if not image_hex_path.exists():
+        return None
+
+    lines = [line.strip() for line in image_hex_path.read_text().splitlines() if line.strip()]
+    try:
+        blocks = [bytes.fromhex(line) for line in lines]
+    except ValueError:
+        return None
+
+    if not blocks:
+        return None
+
+    meta_block = blocks[0]
+    image_size = int.from_bytes(meta_block[0:4], "big")
+    original_bytes = b"".join(blocks[1:])[:image_size] if image_size > 0 else b""
+
+    return {
+        "path": str(image_hex_path),
+        "blocks": blocks,
+        "meta_block": meta_block,
+        "image_size": image_size,
+        "original_bytes": original_bytes,
+    }
 
 
 def parse_boot_sector(boot):
@@ -146,6 +196,7 @@ def maybe_open(paths, auto_open):
 
 
 DEVICE, AUTO_OPEN = parse_args(sys.argv)
+EXPECTED_IMAGE = load_expected_phase1_image()
 
 try:
     with open_raw_device(DEVICE, "rb") as f:
@@ -160,6 +211,9 @@ try:
         print(f"  FS type    : {fs_type!r}")
         print(f"  Volume     : {vol_label!r}")
         print(f"  Sector size: {bpb['bytes_per_sector']} bytes")
+        print(f"  FAT copies : {bpb['num_fats']}")
+        print(f"  FAT size   : {bpb['fat_sectors']} sectors each")
+        print(f"  Root dir   : {bpb['root_sectors']} sector(s)")
         print(f"  Data start : sector {bpb['data_start_sector']}")
 
         root_dir_sector = bpb["reserved_sectors"] + (bpb["num_fats"] * bpb["fat_sectors"])
@@ -180,6 +234,8 @@ try:
         print(f"  1st cluster : {cluster}")
         print(f"  File size   : {file_size} bytes")
         print(f"  DATA.BIN    : starts at physical sector {data_base}")
+        if data_base != EXPECTED_DATA_BASE_SECTOR:
+            print(f"  Warning     : Phase 1 firmware writes fixed sectors starting at {EXPECTED_DATA_BASE_SECTOR}, not {data_base}")
 
         meta_sector = data_base + 0
         key_sector = data_base + 1
@@ -187,6 +243,8 @@ try:
         key_sector_bytes = read_sector_block(f, key_sector, bpb["bytes_per_sector"])
         meta_block = meta_sector_bytes[:16]
         key_block = key_sector_bytes[:16]
+        meta_tail_zero = not any(b != 0 for b in meta_sector_bytes[16:])
+        key_tail_zero = not any(b != 0 for b in key_sector_bytes[16:])
 
         image_size_be = int.from_bytes(meta_block[0:4], "big")
         image_size_le = int.from_bytes(meta_block[0:4], "little")
@@ -213,6 +271,8 @@ try:
         print(f"  Last block valid : {image_file_size - ((image_block_count - 1) * 16) if image_block_count > 0 else 0} bytes")
         print(f"  Metadata block   : {fmt_bytes(meta_block)}")
         print(f"  Key block        : {fmt_bytes(key_block)}")
+        print(f"  Metadata tail    : {'ZERO' if meta_tail_zero else 'NONZERO DATA PRESENT'}")
+        print(f"  Key tail         : {'ZERO' if key_tail_zero else 'NONZERO DATA PRESENT'}")
 
         if image_block_count == 0:
             print("\n=== Checks ===")
@@ -246,6 +306,22 @@ try:
 
         original_ext = detect_file_ext(original_bytes)
         bmp_info = parse_bmp_info(original_bytes)
+        meta_matches_expected = None
+        plain_matches_expected = None
+        key_matches_expected = key_block == FIXED_KEY_BYTES
+
+        if EXPECTED_IMAGE is not None:
+            meta_matches_expected = meta_block == EXPECTED_IMAGE["meta_block"]
+            if image_file_size == EXPECTED_IMAGE["image_size"]:
+                plain_matches_expected = original_bytes == EXPECTED_IMAGE["original_bytes"]
+            else:
+                plain_matches_expected = False
+
+        expected_plain_mismatch = None
+        if EXPECTED_IMAGE is not None:
+            expected_plain_mismatch = first_mismatch(original_bytes, EXPECTED_IMAGE["original_bytes"])
+
+        dec_mismatch = first_mismatch(decrypted_bytes, original_bytes)
 
         print("\n=== Sector Payload Checks ===")
         print(f"  Original sector[0] first 32 bytes : {fmt_bytes(plain_preview)}")
@@ -254,6 +330,26 @@ try:
         print(f"  Original bytes[16:512] zero in every sector : {'YES' if not plain_nonzero_tail else 'NO'}")
         print(f"  Cipher bytes[16:512] zero in every sector   : {'YES' if not ct_nonzero_tail else 'NO'}")
         print(f"  Decrypt bytes[16:512] zero in every sector  : {'YES' if not dec_nonzero_tail else 'NO'}")
+
+        if EXPECTED_IMAGE is not None:
+            print("\n=== Phase 1 Expected Data ===")
+            print(f"  Source file             : {EXPECTED_IMAGE['path']}")
+            print(f"  Metadata vs image_input : {'MATCH' if meta_matches_expected else 'DIFFER'}")
+            print(f"  Key vs fixed key        : {'MATCH' if key_matches_expected else 'DIFFER'}")
+            print(f"  Plaintext vs image_input: {'MATCH' if plain_matches_expected else 'DIFFER'}")
+            if expected_plain_mismatch is not None:
+                mismatch_idx, got_byte, exp_byte = expected_plain_mismatch
+                block_idx = mismatch_idx // 16
+                byte_in_block = mismatch_idx % 16
+                print(
+                    f"  First plaintext mismatch: byte {mismatch_idx} "
+                    f"(sector {plain_base + block_idx}, block byte {byte_in_block}) "
+                    f"got {got_byte:02X} expected {exp_byte:02X}"
+                )
+        else:
+            print("\n=== Phase 1 Expected Data ===")
+            print("  image_input.hex         : not found, skipping metadata/plaintext source check")
+            print(f"  Key vs fixed key        : {'MATCH' if key_matches_expected else 'DIFFER'}")
 
         if bmp_info:
             print("\n=== BMP Info ===")
@@ -267,9 +363,20 @@ try:
         ct_differs = encrypted_bytes != original_bytes
 
         print("\n=== Checks ===")
+        print("  Metadata tail zero      : " + ("YES" if meta_tail_zero else "NO"))
+        print("  Key tail zero           : " + ("YES" if key_tail_zero else "NO"))
         print("  Decrypted vs Original : " + ("MATCH" if dec_ok else "DIFFER"))
         print("  Encrypted vs Original : " + ("DIFFER" if ct_differs else "IDENTICAL"))
         print("  Overall               : " + ("PASS" if dec_ok else "FAIL"))
+        if dec_mismatch is not None:
+            mismatch_idx, dec_byte, orig_byte = dec_mismatch
+            block_idx = mismatch_idx // 16
+            byte_in_block = mismatch_idx % 16
+            print(
+                f"  First decrypt mismatch : byte {mismatch_idx} "
+                f"(sector {dec_base + block_idx}, block byte {byte_in_block}) "
+                f"got {dec_byte:02X} expected {orig_byte:02X}"
+            )
 
         out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify_outputs")
         os.makedirs(out_dir, exist_ok=True)
