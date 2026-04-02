@@ -3176,7 +3176,9 @@ module pcpi_aes #(
 	wire instr_start    = is_custom && (funct7 == 7'b0100010);
 	wire instr_read     = is_custom && (funct7 == 7'b0100011);
 	wire instr_status   = is_custom && (funct7 == 7'b0100100);
-	wire instr_any = instr_load_pt | instr_load_key | instr_start | instr_read | instr_status;
+	wire instr_start_nospi = is_custom && (funct7 == 7'b0100101);
+	wire instr_send_raw = is_custom && (funct7 == 7'b0100110);
+	wire instr_any = instr_load_pt | instr_load_key | instr_start | instr_read | instr_status | instr_start_nospi | instr_send_raw;
 
 	// Internal data registers
 	reg [127:0] PT, KEY, RESULT;
@@ -3184,6 +3186,7 @@ module pcpi_aes #(
 	// AES control
 	reg aes_running;
 	reg aes_encrypt;
+	reg aes_send_spi;
 	wire aes_done;
 	wire [127:0] Dout;
 	reg aes_local_reset;
@@ -3232,6 +3235,7 @@ module pcpi_aes #(
 			RESULT          <= 128'b0;
 			aes_running     <= 0;
 			aes_encrypt     <= 0;
+			aes_send_spi    <= 0;
 			aes_local_reset <= 0;
 			spi_byte_index  <= 0;
 			spi_active      <= 0;
@@ -3284,8 +3288,24 @@ module pcpi_aes #(
 				end
 				else if (instr_start) begin
 					aes_running     <= 1;
+					aes_send_spi    <= 1;
 					aes_local_reset <= 1;  // Reset AES core
 					state           <= START_AES;
+				end
+				else if (instr_start_nospi) begin
+					aes_running     <= 1;
+					aes_send_spi    <= 0;
+					aes_local_reset <= 1;  // Reset AES core
+					state           <= START_AES;
+				end
+				else if (instr_send_raw) begin
+					RESULT         <= PT;
+					spi_byte_index <= 0;
+					spi_active     <= 1;
+					aes_spi_cs_n   <= 0;
+					aes_spi_clk    <= 0;
+					pcpi_wait      <= 1;
+					state          <= SPI_CS_SETUP;
 				end
 				else if (instr_read) begin
 					case (word_index)
@@ -3317,12 +3337,16 @@ module pcpi_aes #(
 			WAIT_AES: begin
 				if (aes_done) begin
 					RESULT         <= Dout;
-					spi_byte_index <= 0;
-					spi_active     <= 1;          // Mark SPI as active
-					aes_spi_cs_n   <= 0;          // Assert chip select (active low)
-					aes_spi_clk    <= 0;
 					aes_running    <= 0;
-					state          <= SPI_CS_SETUP;  // CS setup time
+					if (aes_send_spi) begin
+						spi_byte_index <= 0;
+						spi_active     <= 1;          // Mark SPI as active
+						aes_spi_cs_n   <= 0;          // Assert chip select (active low)
+						aes_spi_clk    <= 0;
+						state          <= SPI_CS_SETUP;  // CS setup time
+					end else begin
+						state <= COMPLETE;
+					end
 				end
 			end
 
@@ -3367,11 +3391,13 @@ module pcpi_aes #(
 			end
 
 			RESPOND: begin
-				pcpi_wr    <= 1;
-				pcpi_ready <= 1;
-				pcpi_wait  <= 0;
-				if (!pcpi_valid)
+				if (pcpi_valid && instr_any) begin
+					pcpi_wr    <= 1;
+					pcpi_ready <= 1;
+					pcpi_wait  <= 0;
+				end else begin
 					state <= IDLE;
+				end
 			end
 
 			default: state <= IDLE;
@@ -3552,11 +3578,13 @@ module pcpi_aes_dec (
 			end
 
 			RESPOND: begin
-				pcpi_wr    <= 1;
-				pcpi_ready <= 1;
-				pcpi_wait  <= 0;
-				if (!pcpi_valid)
+				if (pcpi_valid && instr_any) begin
+					pcpi_wr    <= 1;
+					pcpi_ready <= 1;
+					pcpi_wait  <= 0;
+				end else begin
 					state <= IDLE;
+				end
 			end
 
 			default: state <= IDLE;

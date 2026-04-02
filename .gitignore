@@ -35,7 +35,38 @@
 /synth.log
 /synth.v
 .*.swp
+*.tmp
+*.temp
+*.bak
+*.orig
+*~
+Thumbs.db
+Desktop.ini
 /Sha-Code
 .claude/
 /Makefile
 /CLAUDE.md
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Simulation and generated waveforms
+*.vvp
+*.vcd
+*.gtkw
+*.trace
+*.fst
+
+# Local logs and crash dumps
+*.log
+hs_err_pid*
+
+# Local browser/render cache
+.codex-browser/
+
+# Verification output logs
+verify_outputs/*.log
+
+# Generated poster exports
+docs/*.png

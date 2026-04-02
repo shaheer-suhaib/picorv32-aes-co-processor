@@ -187,7 +187,7 @@ module aes_soc_top_dual_txbram_rxsd (
         .PROGADDR_RESET       (32'h0000_0000),
         .PROGADDR_IRQ         (32'h0000_0010),
         .STACKADDR            (32'h0000_4000),
-        .ENABLE_AES           (0),
+        .ENABLE_AES           (1),
         .ENABLE_AES_DEC       (1)
     ) cpu_rx (
         .clk            (CLK100MHZ),

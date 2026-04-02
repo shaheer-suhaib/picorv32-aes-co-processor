@@ -110,7 +110,10 @@ module fake_sd_phase1_mmio #(
     end
 endmodule
 
-module tb_dual_txbram_rxsd;
+module tb_dual_txbram_rxsd #(
+    parameter integer TAMPER_RX_BLOCK_INDEX = -1,
+    parameter integer BAD_RX_PSK = 0
+);
     localparam integer MEM_SIZE_WORDS = 4096;
     localparam [31:0] SD_BASE      = 32'h0200_0000;
     localparam [31:0] SD_END       = 32'h0200_0400;
@@ -123,7 +126,17 @@ module tb_dual_txbram_rxsd;
     localparam integer KEY_SECTOR = 21;
     localparam integer CT_BASE_SECTOR = 22;
     localparam integer DEC_BASE_SECTOR = 218;
+    localparam integer TAG_SECTOR = DEC_BASE_SECTOR + IMAGE_BLOCKS;
+    localparam integer LOCAL_TAG_SECTOR = TAG_SECTOR + 1;
     localparam integer IMAGE_BASE_WORD = (32'h1000 >> 2);
+    localparam integer KEY_BASE_WORD = (32'h1C60 >> 2);
+    localparam integer MAC_KEY_BASE_WORD = (32'h1C70 >> 2);
+    localparam integer CMAC_K1_BASE_WORD = (32'h1C80 >> 2);
+    localparam integer NONCE_RX_BASE_WORD = (32'h1CE0 >> 2);
+    localparam integer NONCE_TX_BASE_WORD = (32'h1CF0 >> 2);
+    localparam integer PSK_BASE_WORD = (32'h1CD0 >> 2);
+    localparam integer AUX0_IMAGE_OK = 1;
+    localparam integer AUX0_MAC_OK = 2;
 
     reg clk = 0;
     reg resetn = 0;
@@ -178,8 +191,11 @@ module tb_dual_txbram_rxsd;
     wire       rx_unused_spi_cs_n;
     wire       rx_unused_spi_active;
     wire [127:0] rx_block_data;
+    wire [127:0] rx_block_data_effective;
     wire         rx_block_valid;
     wire         rx_block_busy;
+    wire tamper_this_block = (TAMPER_RX_BLOCK_INDEX >= 0) && (rx_valid_count == TAMPER_RX_BLOCK_INDEX);
+    assign rx_block_data_effective = tamper_this_block ? (rx_block_data ^ 128'h00000000000000000000000000000001) : rx_block_data;
 
     integer i;
     integer errors;
@@ -187,7 +203,9 @@ module tb_dual_txbram_rxsd;
     integer mismatch_idx;
     integer tx_data_log_count;
     integer rx_valid_count;
+    integer key_errors;
     reg [31:0] last_tx_count;
+    reg [31:0] last_rx_count;
     reg [7:0] expected_byte;
     reg [7:0] got_byte;
 
@@ -273,7 +291,7 @@ module tb_dual_txbram_rxsd;
         .PROGADDR_RESET       (32'h0000_0000),
         .PROGADDR_IRQ         (32'h0000_0010),
         .STACKADDR            (32'h0000_4000),
-        .ENABLE_AES           (0),
+        .ENABLE_AES           (1),
         .ENABLE_AES_DEC       (1)
     ) cpu_rx (
         .clk            (clk),
@@ -382,7 +400,7 @@ module tb_dual_txbram_rxsd;
         .mem_wdata    (rx_mem_wdata),
         .mem_wstrb    (rx_mem_wstrb),
         .mem_rdata    (rxbuf_rdata),
-        .spi_rx_data  (rx_block_data),
+        .spi_rx_data  (rx_block_data_effective),
         .spi_rx_valid (rx_block_valid),
         .irq_rx       ()
     );
@@ -392,18 +410,42 @@ module tb_dual_txbram_rxsd;
             rx_valid_count <= 0;
         else if (rx_block_valid) begin
             if (rx_valid_count < 4)
-                $display("RX block valid[%0d] data=%032x", rx_valid_count, rx_block_data);
+                $display("RX block valid[%0d] data=%032x%s",
+                         rx_valid_count, rx_block_data_effective,
+                         tamper_this_block ? " [tampered]" : "");
             rx_valid_count <= rx_valid_count + 1;
         end
         if (!resetn)
             last_tx_count <= 0;
         else if (mailbox_i.tx_count_reg != last_tx_count) begin
             if (mailbox_i.tx_count_reg <= 4)
-                $display("TX count -> %0d PT=%032x RESULT=%032x",
+                $display("TX count -> %0d PT=%032x RESULT=%032x CMAC=%08x %08x %08x %08x",
                          mailbox_i.tx_count_reg,
                          cpu_tx.genblk3.pcpi_aes_inst.PT,
-                         cpu_tx.genblk3.pcpi_aes_inst.RESULT);
+                         cpu_tx.genblk3.pcpi_aes_inst.RESULT,
+                         cpu_tx.cpuregs[13],
+                         cpu_tx.cpuregs[14],
+                         cpu_tx.cpuregs[15],
+                         cpu_tx.cpuregs[16]);
             last_tx_count <= mailbox_i.tx_count_reg;
+        end
+        if (!resetn)
+            last_rx_count <= 0;
+        else if (mailbox_i.rx_count_reg != last_rx_count) begin
+            if (mailbox_i.rx_count_reg <= 4)
+                $display("RX count -> %0d CT=%032x RESULT=%032x RX_CMAC=%08x %08x %08x %08x TX_CMAC=%08x %08x %08x %08x",
+                         mailbox_i.rx_count_reg,
+                         cpu_rx.genblk4.pcpi_aes_dec_inst.CT,
+                         cpu_rx.genblk4.pcpi_aes_dec_inst.RESULT,
+                         cpu_rx.cpuregs[13],
+                         cpu_rx.cpuregs[14],
+                         cpu_rx.cpuregs[15],
+                         cpu_rx.cpuregs[16],
+                         cpu_tx.cpuregs[13],
+                         cpu_tx.cpuregs[14],
+                         cpu_tx.cpuregs[15],
+                         cpu_tx.cpuregs[16]);
+            last_rx_count <= mailbox_i.rx_count_reg;
         end
         if (resetn && tx_mem_valid && tx_mem_ready && !tx_mem_instr &&
             tx_bram_sel && tx_mem_wstrb == 4'b0000 &&
@@ -416,6 +458,11 @@ module tb_dual_txbram_rxsd;
             tx_data_log_count <= 0;
     end
 
+    initial begin
+        if (BAD_RX_PSK != 0)
+            rx_bram_i.memory[PSK_BASE_WORD + 0] = rx_bram_i.memory[PSK_BASE_WORD + 0] ^ 32'h00000001;
+    end
+
     initial begin : sim_wait
         $display("=== tb_dual_txbram_rxsd ===");
         repeat (8) @(posedge clk);
@@ -425,7 +472,7 @@ module tb_dual_txbram_rxsd;
         repeat (2000) @(posedge clk);
         btn_start_level <= 1'b0;
 
-        repeat (2000000) begin
+        repeat (7000000) begin
             @(posedge clk);
             if (tx_trap || rx_trap) begin
                 $display("FAIL: trap detected tx=%0d rx=%0d", tx_trap, rx_trap);
@@ -449,6 +496,16 @@ module tb_dual_txbram_rxsd;
         wait (gpio_out_reg[8] || gpio_out_reg[9]);
         repeat (20) @(posedge clk);
         $display("GPIO_OUT = 0x%08x", gpio_out_reg);
+        $display("TX nonce_rx=%08x nonce_tx=%08x", tx_bram_i.memory[NONCE_RX_BASE_WORD + 0], tx_bram_i.memory[NONCE_TX_BASE_WORD + 0]);
+        $display("RX nonce_rx=%08x nonce_tx=%08x", rx_bram_i.memory[NONCE_RX_BASE_WORD + 0], rx_bram_i.memory[NONCE_TX_BASE_WORD + 0]);
+        $display("TX Kenc: %08x %08x %08x %08x", tx_bram_i.memory[KEY_BASE_WORD + 0], tx_bram_i.memory[KEY_BASE_WORD + 1], tx_bram_i.memory[KEY_BASE_WORD + 2], tx_bram_i.memory[KEY_BASE_WORD + 3]);
+        $display("RX Kenc: %08x %08x %08x %08x", rx_bram_i.memory[KEY_BASE_WORD + 0], rx_bram_i.memory[KEY_BASE_WORD + 1], rx_bram_i.memory[KEY_BASE_WORD + 2], rx_bram_i.memory[KEY_BASE_WORD + 3]);
+        $display("TX Kmac: %08x %08x %08x %08x", tx_bram_i.memory[MAC_KEY_BASE_WORD + 0], tx_bram_i.memory[MAC_KEY_BASE_WORD + 1], tx_bram_i.memory[MAC_KEY_BASE_WORD + 2], tx_bram_i.memory[MAC_KEY_BASE_WORD + 3]);
+        $display("RX Kmac: %08x %08x %08x %08x", rx_bram_i.memory[MAC_KEY_BASE_WORD + 0], rx_bram_i.memory[MAC_KEY_BASE_WORD + 1], rx_bram_i.memory[MAC_KEY_BASE_WORD + 2], rx_bram_i.memory[MAC_KEY_BASE_WORD + 3]);
+        $display("TX K1  : %08x %08x %08x %08x", tx_bram_i.memory[CMAC_K1_BASE_WORD + 0], tx_bram_i.memory[CMAC_K1_BASE_WORD + 1], tx_bram_i.memory[CMAC_K1_BASE_WORD + 2], tx_bram_i.memory[CMAC_K1_BASE_WORD + 3]);
+        $display("RX K1  : %08x %08x %08x %08x", rx_bram_i.memory[CMAC_K1_BASE_WORD + 0], rx_bram_i.memory[CMAC_K1_BASE_WORD + 1], rx_bram_i.memory[CMAC_K1_BASE_WORD + 2], rx_bram_i.memory[CMAC_K1_BASE_WORD + 3]);
+        $display("Final TX CMAC regs: %08x %08x %08x %08x", cpu_tx.cpuregs[13], cpu_tx.cpuregs[14], cpu_tx.cpuregs[15], cpu_tx.cpuregs[16]);
+        $display("Final RX CMAC regs: %08x %08x %08x %08x", cpu_rx.cpuregs[13], cpu_rx.cpuregs[14], cpu_rx.cpuregs[15], cpu_rx.cpuregs[16]);
         $write("TX BRAM blk0:");
         for (i = 0; i < 16; i = i + 1)
             $write(" %02x", tx_bram_i.memory[IMAGE_BASE_WORD + 4 + (i >> 2)][8*(i & 32'd3) +: 8]);
@@ -468,9 +525,29 @@ module tb_dual_txbram_rxsd;
         $write("\nDEC block1:");
         for (i = 0; i < 16; i = i + 1)
             $write(" %02x", sd_mmio_i.disk_mem[((DEC_BASE_SECTOR + 1) * 512) + i]);
+        $write("\nTAG block :");
+        for (i = 0; i < 16; i = i + 1)
+            $write(" %02x", sd_mmio_i.disk_mem[(TAG_SECTOR * 512) + i]);
+        $write("\nLOC tag  :");
+        for (i = 0; i < 16; i = i + 1)
+            $write(" %02x", sd_mmio_i.disk_mem[(LOCAL_TAG_SECTOR * 512) + i]);
         $write("\n");
         errors = 0;
         mismatch_idx = -1;
+        key_errors = 0;
+
+        for (i = 0; i < 4; i = i + 1) begin
+            if (tx_bram_i.memory[NONCE_RX_BASE_WORD + i] !== rx_bram_i.memory[NONCE_RX_BASE_WORD + i])
+                key_errors = key_errors + 1;
+            if (tx_bram_i.memory[NONCE_TX_BASE_WORD + i] !== rx_bram_i.memory[NONCE_TX_BASE_WORD + i])
+                key_errors = key_errors + 1;
+            if (tx_bram_i.memory[KEY_BASE_WORD + i] !== rx_bram_i.memory[KEY_BASE_WORD + i])
+                key_errors = key_errors + 1;
+            if (tx_bram_i.memory[MAC_KEY_BASE_WORD + i] !== rx_bram_i.memory[MAC_KEY_BASE_WORD + i])
+                key_errors = key_errors + 1;
+            if (tx_bram_i.memory[CMAC_K1_BASE_WORD + i] !== rx_bram_i.memory[CMAC_K1_BASE_WORD + i])
+                key_errors = key_errors + 1;
+        end
 
         for (i = 0; i < (IMAGE_BLOCKS * 16); i = i + 1) begin
             if (i < 3126) begin
@@ -504,13 +581,33 @@ module tb_dual_txbram_rxsd;
         $display("Mailbox flags=0x%08x expected=%0d tx_count=%0d rx_count=%0d",
                  mailbox_i.flags_reg, mailbox_i.expected_blocks_reg,
                  mailbox_i.tx_count_reg, mailbox_i.rx_count_reg);
+        $display("Mailbox aux0 = 0x%08x", mailbox_i.aux0_reg);
+        $display("Key agreement mismatches = %0d", key_errors);
 
-        if (gpio_out_reg[8] && errors == 0) begin
-            $display("PASS: RX firmware reported pass and first block matches expected image");
-        end else if (gpio_out_reg[9]) begin
-            $display("FAIL: RX firmware reported fail (errors=%0d)", errors);
+        if (BAD_RX_PSK != 0) begin
+            if (gpio_out_reg[9] && key_errors != 0) begin
+                $display("PASS: PSK mismatch caused divergent session keys and transfer rejection");
+            end else begin
+                $display("FAIL: PSK mismatch case did not diverge or reject as expected (errors=%0d key_errors=%0d)", errors, key_errors);
+            end
+        end else if (TAMPER_RX_BLOCK_INDEX < 0) begin
+            if (gpio_out_reg[8] && errors == 0 &&
+                mailbox_i.aux0_reg == (AUX0_IMAGE_OK | AUX0_MAC_OK) &&
+                key_errors == 0) begin
+                $display("PASS: PSK handshake derived matching session keys and CMAC-protected transfer accepted");
+            end else if (gpio_out_reg[9]) begin
+                $display("FAIL: RX firmware reported fail (errors=%0d key_errors=%0d)", errors, key_errors);
+            end else begin
+                $display("FAIL: verification errors=%0d key_errors=%0d", errors, key_errors);
+            end
         end else begin
-            $display("FAIL: verification errors=%0d", errors);
+            if (gpio_out_reg[9] && errors == 0 &&
+                mailbox_i.aux0_reg == AUX0_IMAGE_OK &&
+                key_errors == 0) begin
+                $display("PASS: tampered tag detected by CMAC while session keys still matched");
+            end else begin
+                $display("FAIL: tamper case did not produce the expected CMAC-only rejection (errors=%0d key_errors=%0d)", errors, key_errors);
+            end
         end
         $finish;
     end
