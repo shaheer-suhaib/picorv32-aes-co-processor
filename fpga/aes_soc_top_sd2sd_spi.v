@@ -38,6 +38,7 @@ module aes_soc_top_sd2sd_spi (
     output wire [6:0]  SEG
 );
 
+    localparam ENABLE_MANUAL_SPI_TEST = 1'b0;
     localparam integer MEM_SIZE_WORDS = 4096;
     localparam [31:0] SD_BASE    = 32'h0200_0000;
     localparam [31:0] SD_END     = 32'h0200_0400;
@@ -245,9 +246,9 @@ module aes_soc_top_sd2sd_spi (
     assign LED[9] = rx_block_busy;
     assign LED[10] = cpu_spi_active | manual_active;
     assign LED[11] = ~SPI_CS_N_IN;
-    assign LED[12] = SPI_CLK_IN;
-    assign LED[13] = SPI_DATA_IN[0];
-    assign LED[14] = SPI_DATA_IN[1];
+    assign LED[12] = (~SPI_CS_N_IN) & SPI_CLK_IN;
+    assign LED[13] = (~SPI_CS_N_IN) & SPI_DATA_IN[0];
+    assign LED[14] = (~SPI_CS_N_IN) & SPI_DATA_IN[1];
     assign LED[15] = display_error;
 
     // --- Manual SPI test generator (debug only) ---
@@ -277,7 +278,7 @@ module aes_soc_top_sd2sd_spi (
             btn_start_prev <= btn_start_level;
 
             // start on rising edge of button
-            if (btn_start_level && !btn_start_prev) begin
+            if (ENABLE_MANUAL_SPI_TEST && btn_start_level && !btn_start_prev) begin
                 manual_active   <= 1'b1;
                 manual_byte_idx <= 4'd0;
                 manual_byte_cnt <= 8'd0;
@@ -308,9 +309,9 @@ module aes_soc_top_sd2sd_spi (
     end
 
     // Multiplex top-level SPI outputs between CPU and manual generator
-    assign SPI_DATA   = manual_active ? manual_spi_data : cpu_spi_data;
-    assign SPI_CLK    = manual_active ? manual_spi_clk  : cpu_spi_clk;
-    assign SPI_CS_N   = manual_active ? manual_spi_cs_n: cpu_spi_cs_n;
+    assign SPI_DATA   = (ENABLE_MANUAL_SPI_TEST && manual_active) ? manual_spi_data : cpu_spi_data;
+    assign SPI_CLK    = (ENABLE_MANUAL_SPI_TEST && manual_active) ? manual_spi_clk  : cpu_spi_clk;
+    assign SPI_CS_N   = (ENABLE_MANUAL_SPI_TEST && manual_active) ? manual_spi_cs_n : cpu_spi_cs_n;
 
 endmodule
 

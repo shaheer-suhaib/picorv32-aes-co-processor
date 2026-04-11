@@ -68,14 +68,14 @@ set_property -dict { PACKAGE_PIN E16 IOSTANDARD LVCMOS33 } [get_ports { SPI_CLK 
 set_property -dict { PACKAGE_PIN F13 IOSTANDARD LVCMOS33 } [get_ports { SPI_CS_N }]     ;# JB8
 
 ## SPI RX inputs (Pmod JC + JD)
-set_property -dict { PACKAGE_PIN K1 IOSTANDARD LVCMOS33 } [get_ports { SPI_DATA_IN[0] }] ;# JC1
-set_property -dict { PACKAGE_PIN F6 IOSTANDARD LVCMOS33 } [get_ports { SPI_DATA_IN[1] }] ;# JC2
-set_property -dict { PACKAGE_PIN J2 IOSTANDARD LVCMOS33 } [get_ports { SPI_DATA_IN[2] }] ;# JC3
-set_property -dict { PACKAGE_PIN G6 IOSTANDARD LVCMOS33 } [get_ports { SPI_DATA_IN[3] }] ;# JC4
+set_property -dict { PACKAGE_PIN K1 IOSTANDARD LVCMOS33 PULLDOWN true } [get_ports { SPI_DATA_IN[0] }] ;# JC1
+set_property -dict { PACKAGE_PIN F6 IOSTANDARD LVCMOS33 PULLDOWN true } [get_ports { SPI_DATA_IN[1] }] ;# JC2
+set_property -dict { PACKAGE_PIN J2 IOSTANDARD LVCMOS33 PULLDOWN true } [get_ports { SPI_DATA_IN[2] }] ;# JC3
+set_property -dict { PACKAGE_PIN G6 IOSTANDARD LVCMOS33 PULLDOWN true } [get_ports { SPI_DATA_IN[3] }] ;# JC4
 
-set_property -dict { PACKAGE_PIN H4 IOSTANDARD LVCMOS33 } [get_ports { SPI_DATA_IN[4] }] ;# JD1
-set_property -dict { PACKAGE_PIN H1 IOSTANDARD LVCMOS33 } [get_ports { SPI_DATA_IN[5] }] ;# JD2
-set_property -dict { PACKAGE_PIN G1 IOSTANDARD LVCMOS33 } [get_ports { SPI_DATA_IN[6] }] ;# JD3
-set_property -dict { PACKAGE_PIN G3 IOSTANDARD LVCMOS33 } [get_ports { SPI_DATA_IN[7] }] ;# JD4
-set_property -dict { PACKAGE_PIN H2 IOSTANDARD LVCMOS33 } [get_ports { SPI_CLK_IN }]     ;# JD7
-set_property -dict { PACKAGE_PIN G4 IOSTANDARD LVCMOS33 } [get_ports { SPI_CS_N_IN }]    ;# JD8
+set_property -dict { PACKAGE_PIN H4 IOSTANDARD LVCMOS33 PULLDOWN true } [get_ports { SPI_DATA_IN[4] }] ;# JD1
+set_property -dict { PACKAGE_PIN H1 IOSTANDARD LVCMOS33 PULLDOWN true } [get_ports { SPI_DATA_IN[5] }] ;# JD2
+set_property -dict { PACKAGE_PIN G1 IOSTANDARD LVCMOS33 PULLDOWN true } [get_ports { SPI_DATA_IN[6] }] ;# JD3
+set_property -dict { PACKAGE_PIN G3 IOSTANDARD LVCMOS33 PULLDOWN true } [get_ports { SPI_DATA_IN[7] }] ;# JD4
+set_property -dict { PACKAGE_PIN H2 IOSTANDARD LVCMOS33 PULLDOWN true } [get_ports { SPI_CLK_IN }]     ;# JD7
+set_property -dict { PACKAGE_PIN G4 IOSTANDARD LVCMOS33 PULLDOWN true } [get_ports { SPI_CS_N_IN }]    ;# JD8

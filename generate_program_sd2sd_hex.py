@@ -259,6 +259,12 @@ def generate_program():
     load_abs(p, 7, BUF_BASE)
     load_abs(p, 8, RXBUF_BASE)
 
+    # VERY IMPORTANT: Initialize x20..x23 to 0..3 for AES word indexes!
+    p.emit(addi(20, 0, 0))
+    p.emit(addi(21, 0, 1))
+    p.emit(addi(22, 0, 2))
+    p.emit(addi(23, 0, 3))
+
     p.label("wait_init")
     p.emit(lw(29, 5, 4))
     p.emit(andi(30, 29, 1))
@@ -303,6 +309,12 @@ def generate_program():
     p.emit(aes_load_pt(19, 23))
     p.emit(aes_send_raw())
 
+    # ADD A DELAY HERE TOO (For the Meta block)!
+    p.emit(lui(25, 150))
+    p.label("tx_delay_meta")
+    p.emit(addi(25, 25, -1))
+    p.branch_bne(25, 0, "tx_delay_meta")
+
     # block_count = (size + 15) >> 4 ; size = word0 (little endian)
     p.emit(addi(10, 16, 15))
     p.emit(srli(10, 10, 4))
@@ -321,6 +333,13 @@ def generate_program():
     p.emit(aes_load_pt(18, 22))
     p.emit(aes_load_pt(19, 23))
     p.emit(aes_send_raw())
+
+    # ADD A DELAY! The receiver's sd_write() takes longer than our sd_read(). 
+    # Give the receiver enough time before we blast the next SPI packet to avoid packet drop.
+    p.emit(lui(25, 150)) # load ~600k into x25
+    p.label("tx_delay_loop")
+    p.emit(addi(25, 25, -1))
+    p.branch_bne(25, 0, "tx_delay_loop")
     p.emit(addi(11, 11, 1))
     p.emit(addi(10, 10, -1))
     p.branch_bne(10, 0, "tx_loop")

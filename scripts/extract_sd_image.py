@@ -116,7 +116,14 @@ def main():
         out_f.write(output)
 
     print(f"Extracted {len(output)} bytes to {out_path}")
-
+    
+    # Automatically open the reconstructed image to show the user
+    if os.name == "nt":
+        try:
+            os.startfile(out_path)
+            print("Opening the image automatically...")
+        except Exception as e:
+            print(f"Extraction successful, but could not auto-open image: {e}")
 
 if __name__ == "__main__":
     main()
