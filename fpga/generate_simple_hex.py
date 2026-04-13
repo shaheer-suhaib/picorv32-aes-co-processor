@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
 """
-Generate hex file for BRAM initialization with Simple AES Tx/Rx program
-Output format: Verilog $readmemh compatible (one 32-bit hex value per line)
-
-Register allocation:
-  x1  = GPIO_BASE   (0x20000000)
-  x2  = RXBUF_BASE  (0x30000000)
-  x3  = KEY_BASE    (0x00001000)
-  x4  = temp / status polling
-  x5  = temp / data word
-  x6  = temp / key word
-  x7  = AES word index (0-3), set with addi before each AES custom instruction
+FIXED Full Pipeline: AES Encrypt → Manual SPI → AES Decrypt
+Uses AES_START_NOSPI + manual AES_READ + SEND_RAW for transmission,
+avoiding the auto-SPI path in AES_START which has a subtle timing bug.
 """
 
 def encode_i_type(opcode, funct3, rd, rs1, imm):
@@ -32,7 +24,6 @@ def encode_b_type(opcode, funct3, rs1, rs2, imm):
     return ((imm_12 << 31) | (imm_10_5 << 25) | (rs2 << 20) | (rs1 << 15) | \
            (funct3 << 12) | (imm_4_1 << 8) | (imm_11 << 7) | opcode) & 0xFFFFFFFF
 
-# Instruction encoders
 def lui(rd, imm):
     return ((imm & 0xFFFFF) << 12) | (rd << 7) | 0b0110111
 
@@ -51,27 +42,41 @@ def beqz(rs1, offset):
 def bnez(rs1, offset):
     return encode_b_type(0b1100011, 0b001, rs1, 0, offset)
 
-def j(offset): # jal x0, offset
+def j(offset):
     imm_20 = (offset >> 20) & 0x1
     imm_10_1 = (offset >> 1) & 0x3FF
     imm_11 = (offset >> 11) & 0x1
     imm_19_12 = (offset >> 12) & 0xFF
     return ((imm_20 << 31) | (imm_19_12 << 12) | (imm_11 << 20) | (imm_10_1 << 21) | (0 << 7) | 0b1101111) & 0xFFFFFFFF
 
-# AES custom instructions (opcode 0x0B = 0b0001011)
-# rs1 VALUE[1:0] = word index, rs2 VALUE = data word
+def nop():
+    return addi(0, 0, 0)
+
+IDX_REG = 7
+
+# AES Encryption instructions
 def aes_load_pt(rs2, rs1):
     return encode_r_type(0b0001011, 0b000, 0b0100000, 0, rs1, rs2)
 
 def aes_load_key(rs2, rs1):
     return encode_r_type(0b0001011, 0b000, 0b0100001, 0, rs1, rs2)
 
-def aes_start():
-    return encode_r_type(0b0001011, 0b000, 0b0100010, 0, 0, 0)
+def aes_start_nospi():
+    """Encrypt WITHOUT auto-SPI transmission"""
+    return encode_r_type(0b0001011, 0b000, 0b0100101, 0, 0, 0)
 
 def aes_status(rd):
     return encode_r_type(0b0001011, 0b000, 0b0100100, rd, 0, 0)
 
+def aes_read(rd, rs1):
+    """Read encrypted result: rd = RESULT[rs1[1:0]]"""
+    return encode_r_type(0b0001011, 0b000, 0b0100011, rd, rs1, 0)
+
+def aes_send_raw():
+    """Copy PT to RESULT and transmit via SPI (proven to work!)"""
+    return encode_r_type(0b0001011, 0b000, 0b0100110, 0, 0, 0)
+
+# AES Decryption instructions
 def aes_dec_load_ct(rs2, rs1):
     return encode_r_type(0b0001011, 0b000, 0b0101000, 0, rs1, rs2)
 
@@ -87,131 +92,129 @@ def aes_dec_read(rd, rs1):
 def aes_dec_status(rd):
     return encode_r_type(0b0001011, 0b000, 0b0101100, rd, 0, 0)
 
-def nop():
-    return addi(0, 0, 0)
-
 def load_const(rd, val):
-    """Macro to load 32-bit constant into register using lui and addi"""
     upper = (val >> 12) & 0xFFFFF
     lower = val & 0xFFF
-    if (lower & 0x800): # Sign extension compensation
+    if (lower & 0x800):
         upper = (upper + 1) & 0xFFFFF
     return [lui(rd, upper), addi(rd, rd, lower | (0xFFFFF000 if lower & 0x800 else 0))]
 
-# x7 is the dedicated index register for AES word indices
-IDX_REG = 7
-
 def generate_program():
     program = []
-    
-    # === Setup base address registers ===
+
     program.extend(load_const(1, 0x20000000))  # x1 = GPIO_BASE
     program.extend(load_const(2, 0x30000000))  # x2 = RXBUF_BASE
-    program.extend(load_const(3, 0x00001000))  # x3 = KEY_BASE (in BRAM)
-    
-    # -----------------------
-    # Main Loop (Label: loop)
-    # -----------------------
+    program.extend(load_const(3, 0x00001000))  # x3 = KEY_BASE
+
+    # =====================
+    # Main Loop
+    # =====================
     loop_label = len(program)
-    
-    # Check BTNC: read GPIO_BASE + 0x04
+
+    # Check BTNC
     program.append(lw(4, 1, 4))
     branch_to_tx_idx = len(program)
-    program.append(nop()) # placeholder for bnez -> tx_mode
-    
-    # Check RX_STATUS: read RXBUF_BASE + 0x00
+    program.append(nop())  # placeholder
+
+    # Check RX_STATUS
     program.append(lw(4, 2, 0))
     branch_to_rx_idx = len(program)
-    program.append(nop()) # placeholder for bnez -> rx_mode
-    
-    # j loop
+    program.append(nop())  # placeholder
+
     program.append(j((loop_label - len(program)) * 4))
-    
-    # ===========================
-    # TX_MODE: Encrypt & Transmit
-    # ===========================
+
+    # =============================================
+    # TX_MODE: Encrypt → Read ciphertext → SEND_RAW
+    # =============================================
     tx_mode_label = len(program)
     program[branch_to_tx_idx] = bnez(4, (tx_mode_label - branch_to_tx_idx) * 4)
-    
-    # Wait for button release so we don't re-trigger
+
+    # Wait for button release
     wait_btn_label = len(program)
     program.append(lw(4, 1, 4))
     program.append(bnez(4, (wait_btn_label - len(program)) * 4))
-    
-    # Read SW[15:0] from GPIO_BASE + 0x00
-    program.append(lw(5, 1, 0))  # x5 = switch value
-    
+
+    # Read switches
+    program.append(lw(5, 1, 0))  # x5 = SW
+
     # Load PT[0] = switch value, PT[1..3] = 0
-    # Using x7 as index register, x0 as zero source
-    program.append(addi(IDX_REG, 0, 0))      # x7 = 0
-    program.append(aes_load_pt(5, IDX_REG))   # PT[0] = x5(switches)
-    program.append(addi(IDX_REG, 0, 1))      # x7 = 1
-    program.append(aes_load_pt(0, IDX_REG))   # PT[1] = 0
-    program.append(addi(IDX_REG, 0, 2))      # x7 = 2
-    program.append(aes_load_pt(0, IDX_REG))   # PT[2] = 0
-    program.append(addi(IDX_REG, 0, 3))      # x7 = 3
-    program.append(aes_load_pt(0, IDX_REG))   # PT[3] = 0
-    
-    # Load KEY[0..3] from BRAM
+    program.append(addi(IDX_REG, 0, 0))
+    program.append(aes_load_pt(5, IDX_REG))
+    program.append(addi(IDX_REG, 0, 1))
+    program.append(aes_load_pt(0, IDX_REG))
+    program.append(addi(IDX_REG, 0, 2))
+    program.append(aes_load_pt(0, IDX_REG))
+    program.append(addi(IDX_REG, 0, 3))
+    program.append(aes_load_pt(0, IDX_REG))
+
+    # Load KEY for encryption
     for i in range(4):
-        program.append(lw(6, 3, i*4))            # x6 = key word from memory
-        program.append(addi(IDX_REG, 0, i))       # x7 = i
-        program.append(aes_load_key(6, IDX_REG))  # KEY[i] = x6
-    
-    # Start AES encryption (triggers SPI automatically on completion)
-    program.append(aes_start())
-    
-    # Poll for encryption completion
-    tx_poll_label = len(program)
+        program.append(lw(6, 3, i*4))
+        program.append(addi(IDX_REG, 0, i))
+        program.append(aes_load_key(6, IDX_REG))
+
+    # Encrypt WITHOUT auto-SPI
+    program.append(aes_start_nospi())
+
+    # Poll encryption status
+    enc_poll_label = len(program)
     program.append(aes_status(4))
-    program.append(beqz(4, (tx_poll_label - len(program)) * 4))
-    
-    # Show switch value on LEDs to confirm TX
+    program.append(beqz(4, (enc_poll_label - len(program)) * 4))
+
+    # Read 4 encrypted words and load them back into PT for SEND_RAW
+    for i in range(4):
+        program.append(addi(IDX_REG, 0, i))
+        program.append(aes_read(8, IDX_REG))       # x8 = RESULT[i] (ciphertext word)
+        program.append(aes_load_pt(8, IDX_REG))     # PT[i] = ciphertext word
+
+    # Transmit ciphertext using SEND_RAW (copies PT to RESULT, sends via SPI)
+    # This is the EXACT same SPI path that works in the bypass test!
+    program.append(aes_send_raw())
+
+    # Show switch value on LEDs
     program.append(sw(5, 1, 8))
-    
+
     # Jump back to main loop
     program.append(j((loop_label - len(program)) * 4))
-    
-    # ===========================
-    # RX_MODE: Receive & Decrypt
-    # ===========================
+
+    # =============================================
+    # RX_MODE: Read SPI data → Decrypt → Display
+    # =============================================
     rx_mode_label = len(program)
     program[branch_to_rx_idx] = bnez(4, (rx_mode_label - branch_to_rx_idx) * 4)
-    
-    # Load received ciphertext CT[0..3] from RX buffer
+
+    # Load received ciphertext into decryption module
     for i in range(4):
-        program.append(lw(5, 2, 4 + i*4))            # x5 = RX_DATA_i
-        program.append(addi(IDX_REG, 0, i))           # x7 = i
-        program.append(aes_dec_load_ct(5, IDX_REG))   # CT[i] = x5
-    
-    # Load KEY[0..3] from BRAM (same key as TX side)
+        program.append(lw(5, 2, 4 + i*4))           # x5 = RX_DATA_i
+        program.append(addi(IDX_REG, 0, i))
+        program.append(aes_dec_load_ct(5, IDX_REG))  # CT[i] = x5
+
+    # Load KEY for decryption
     for i in range(4):
-        program.append(lw(6, 3, i*4))                 # x6 = key word
-        program.append(addi(IDX_REG, 0, i))            # x7 = i
-        program.append(aes_dec_load_key(6, IDX_REG))   # KEY[i] = x6
-    
-    # Start AES decryption
+        program.append(lw(6, 3, i*4))
+        program.append(addi(IDX_REG, 0, i))
+        program.append(aes_dec_load_key(6, IDX_REG))
+
+    # Decrypt
     program.append(aes_dec_start())
-    
-    # Poll for decryption completion
-    rx_poll_label = len(program)
+
+    # Poll decryption status
+    dec_poll_label = len(program)
     program.append(aes_dec_status(4))
-    program.append(beqz(4, (rx_poll_label - len(program)) * 4))
-    
-    # Read decrypted word 0 (contains the original switch value)
-    program.append(addi(IDX_REG, 0, 0))           # x7 = 0
-    program.append(aes_dec_read(5, IDX_REG))       # x5 = decrypted PT[0]
-    
-    # Show on LEDs
-    program.append(sw(5, 1, 8))     # LED[15:0] = decrypted value
-    
-    # Show lower 4 bits on 7-segment
-    program.append(sw(5, 1, 0x0C))  # SEG digit = decrypted[3:0]
-    
-    # Clear RX status so we can receive again
+    program.append(beqz(4, (dec_poll_label - len(program)) * 4))
+
+    # Read decrypted word 0
+    program.append(addi(IDX_REG, 0, 0))
+    program.append(aes_dec_read(5, IDX_REG))
+
+    # Display on LEDs and 7-seg
+    program.append(sw(5, 1, 8))
+    program.append(sw(5, 1, 0x0C))
+
+    # Clear RX status
     program.append(sw(0, 2, 0x14))
-    
-    # Jump back to main loop
+
+    # Jump back
     program.append(j((loop_label - len(program)) * 4))
 
     return program
@@ -224,7 +227,7 @@ def main():
     for i, instr in enumerate(program):
         memory[i] = instr
 
-    # 128-bit AES key stored at 0x1000 (word offset 0x400)
+    # 128-bit AES key at 0x1000
     KEY = 0x1234567890ABCDEF1122334455667788
     key_words = [
         (KEY >>  0) & 0xFFFFFFFF,
@@ -242,7 +245,9 @@ def main():
 
     print(f"Generated {output_file}")
     print(f"  Program size: {len(program)} instructions")
-    print(f"  Key: 0x{KEY:032x}")
+    print(f"  MODE: FIXED FULL PIPELINE")
+    print(f"  TX: AES_ENCRYPT (no auto-SPI) -> read ciphertext -> SEND_RAW")
+    print(f"  RX: Read SPI data -> AES_DECRYPT -> display on LEDs/7seg")
 
 if __name__ == "__main__":
     main()
