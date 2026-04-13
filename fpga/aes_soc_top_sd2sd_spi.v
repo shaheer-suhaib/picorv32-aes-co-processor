@@ -137,7 +137,7 @@ module aes_soc_top_sd2sd_spi (
         .PROGADDR_IRQ         (32'h0000_0010),
         .STACKADDR            (32'h0000_4000),
         .ENABLE_AES           (1),
-        .ENABLE_AES_DEC       (0)
+        .ENABLE_AES_DEC       (1)
     ) cpu_i (
         .clk            (CLK100MHZ),
         .resetn         (resetn),
@@ -158,7 +158,7 @@ module aes_soc_top_sd2sd_spi (
 
     bram_memory #(
         .MEM_SIZE_WORDS (MEM_SIZE_WORDS),
-        .MEM_INIT_FILE  ("program_sd2sd.hex")
+        .MEM_INIT_FILE  ("C:/AllData/FYPnew/cmacaddedFYP/picorv32-aes-co-processor/fpga/program_sd2sd.hex")
     ) bram_i (
         .clk       (CLK100MHZ),
         .resetn    (resetn),

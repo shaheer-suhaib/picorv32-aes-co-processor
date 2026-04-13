@@ -12,7 +12,7 @@
  *******************************************************************/
 module bram_memory #(
     parameter MEM_SIZE_WORDS = 2048,  // 2K words = 8 KB
-    parameter MEM_INIT_FILE = ""      // Optional initialization file
+    parameter MEM_INIT_FILE = "C:/AllData/FYPnew/cmacaddedFYP/picorv32-aes-co-processor/fpga/program_sd2sd.hex"      // Optional initialization file
 ) (
     input  wire        clk,
     input  wire        resetn,
