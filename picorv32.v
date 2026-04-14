@@ -3222,6 +3222,7 @@ module pcpi_aes #(
 
 	reg [3:0] state;
 	reg [1:0] word_index;
+	reg [7:0] spi_delay_count;
 
 	always @(posedge clk) begin
 		if (!resetn) begin
@@ -3239,6 +3240,7 @@ module pcpi_aes #(
 			aes_local_reset <= 0;
 			spi_byte_index  <= 0;
 			spi_active      <= 0;
+			spi_delay_count <= 0;
 			aes_spi_data    <= 8'b0;
 			aes_spi_clk     <= 0;
 			aes_spi_cs_n    <= 1;  // Inactive high
@@ -3351,33 +3353,53 @@ module pcpi_aes #(
 			end
 
 			SPI_CS_SETUP: begin
-				// Give chip select one full cycle before presenting the first byte.
-				state <= SPI_LOAD;
+				// Give chip select some setup time before presenting the first byte.
+				if (spi_delay_count == 0) begin
+					spi_delay_count <= 5;
+					state <= SPI_LOAD;
+				end else begin
+					spi_delay_count <= spi_delay_count - 1'b1;
+				end
 			end
 
 			SPI_LOAD: begin
 				// Present the next byte while the strobe clock remains low.
 				aes_spi_data <= RESULT[(spi_byte_index*8) +: 8];
 				aes_spi_clk  <= 0;
-				state        <= SPI_CLK_HIGH;
+				if (spi_delay_count == 0) begin
+					spi_delay_count <= 5;
+					state        <= SPI_CLK_HIGH;
+				end else begin
+					spi_delay_count <= spi_delay_count - 1'b1;
+				end
 			end
 
 			SPI_CLK_HIGH: begin
 				aes_spi_clk <= 1;
-				state       <= SPI_CLK_LOW;
+				if (spi_delay_count == 0) begin
+					spi_delay_count <= 5;
+					state       <= SPI_CLK_LOW;
+				end else begin
+					spi_delay_count <= spi_delay_count - 1'b1;
+				end
 			end
 
 			SPI_CLK_LOW: begin
 				// Complete the clock cycle by bringing clock low
 				aes_spi_clk <= 0;
-				if (spi_byte_index < 15) begin
-					spi_byte_index <= spi_byte_index + 1'b1;
-					state          <= SPI_LOAD;
+				if (spi_delay_count == 0) begin
+					spi_delay_count <= 5;
+					if (spi_byte_index < 15) begin
+						spi_byte_index <= spi_byte_index + 1'b1;
+						state          <= SPI_LOAD;
+					end else begin
+						// All 16 bytes sent
+						spi_active   <= 0;
+						aes_spi_cs_n <= 1;  // Deassert chip select
+						state        <= COMPLETE;
+					end
 				end else begin
-					// All 16 bytes sent
-					spi_active   <= 0;
-					aes_spi_cs_n <= 1;  // Deassert chip select
-					state        <= COMPLETE;
+					spi_delay_count <= spi_delay_count - 1'b1;
 				end
 			end
 

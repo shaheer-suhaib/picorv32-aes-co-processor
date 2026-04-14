@@ -152,6 +152,7 @@ MAC_KEY_ADDR   = 0x1010
 CMAC_K1_ADDR   = 0x1020
 CMAC_HDR_ADDR  = 0x1030
 META_ADDR      = 0x1040   # {image_size, total_blocks, total_data_sectors, 0}
+IMAGE_BUF_ADDR = 0x1100   # RX image buffer in BRAM (up to ~14KB free)
 
 IDX = 7  # x7 = index register for AES instructions
 
@@ -311,15 +312,6 @@ def generate_firmware():
     p.emit(andi(4, 4, 8))              # bit3 = rd_done
     p.branch_beq(4, 0, "tx_sd_read_wait")
 
-    # === Wait ~15ms for RX to finish its SD write from previous sector ===
-    # SD card write + flash programming takes 5-10ms on the RX side.
-    # At 100MHz: 15ms = 1,500,000 cycles. Loop = 4 cycles/iter.
-    # 1,500,000 / 4 ≈ 375,000 ≈ 0x5B8D8. Use lui(30, 0x5C) = 0x5C000 = 376,832
-    p.emit(lui(30, 0x5C))
-    p.label("tx_sector_pace")
-    p.emit(addi(30, 30, -1))
-    p.branch_bne(30, 0, "tx_sector_pace")
-
     # Reset block-within-sector counter
     p.emit(addi(26, 0, 0))             # x26 = 0
 
@@ -405,58 +397,33 @@ def generate_firmware():
     p.jump("tx_halt")
 
     # =========================================================
-    # RX MODE: Receive SPI -> Decrypt -> CMAC verify -> Write SD
+    # RX MODE: Buffer all data in BRAM, then write to SD at end
+    # NEW APPROACH: No SD writes during SPI reception.
+    # All decrypted blocks go into BRAM IMAGE_BUF_ADDR first.
+    # Only after all blocks received + CMAC verified -> write SD.
+    # This eliminates all TX/RX timing races completely.
     # =========================================================
     p.label("rx_mode")
 
-    # Show 0x3 (receiving)
+    # Show 3 on display (receiving)
     p.emit(addi(4, 0, 0x13))
     p.emit(sw(4, 1, GPIO_OUT))
 
-    # --- Step 1: Read header block (unencrypted) ---
-    # First SPI block is already available (triggered rx_mode)
+    # --- Read header block (already in RXBUF, triggered rx_mode) ---
     p.emit(lw(24, 2, 4))    # x24 = total_blocks
-    p.emit(lw(29, 2, 8))    # x29 = image_size
+    p.emit(lw(29, 2, 8))    # x29 = image_size (save for SD write phase)
     p.emit(sw(0, 2, 0x14))  # Clear RX status
-
-    # Write metadata to sector 0 of RX SD card
-    # Store image_size in sector_buf[0..3]
-    p.emit(sw(29, 3, 0))    # sector_buf[0] = image_size
-    p.emit(sw(24, 3, 4))    # sector_buf[4] = total_blocks
-    p.emit(sw(0, 3, 8))
-    p.emit(sw(0, 3, 12))
-    # Write sector 0
-    p.emit(sw(0, 1, SD_SECTOR))
-    p.emit(addi(4, 0, 8))
-    p.emit(sw(4, 1, SD_CTRL))   # clear wr_done
-    p.emit(addi(4, 0, 2))
-    p.emit(sw(4, 1, SD_CTRL))   # wr_start
-    p.label("rx_meta_wr_wait")
-    p.emit(lw(4, 1, SD_STATUS))
-    p.emit(andi(4, 4, 16))      # bit4 = wr_done
-    p.branch_beq(4, 0, "rx_meta_wr_wait")
 
     # Initialize CMAC
     emit_cmac_init(p)
 
-    # Load decryption key
+    # Load decryption key base into x6
     emit_load_dec_key(p, 6)
 
-    # x25 = current write sector (starts at 1)
-    # x26 = block within sector (0-31)
-    p.emit(addi(25, 0, 1))
-    p.emit(addi(26, 0, 0))
+    # x25 = BRAM write pointer = IMAGE_BUF_ADDR
+    load_abs(p, 25, IMAGE_BUF_ADDR)
 
-    # Zero the sector buffer before starting
-    p.emit(addi(28, 0, 0))  # offset
-    p.label("rx_zero_buf")
-    p.emit(add(29, 3, 28))
-    p.emit(sw(0, 29, 0))
-    p.emit(addi(28, 28, 4))
-    p.emit(addi(31, 0, 0x200))  # 512
-    p.branch_bne(28, 31, "rx_zero_buf")
-
-    # === RX data loop ===
+    # === RX data loop: receive -> decrypt -> store in BRAM ===
     p.label("rx_data_loop")
 
     # Wait for next SPI block
@@ -470,14 +437,13 @@ def generate_firmware():
     p.emit(lw(21, 2, 8))
     p.emit(lw(22, 2, 12))
     p.emit(lw(23, 2, 16))
-    p.emit(sw(0, 2, 0x14))  # Clear RX status
+    p.emit(sw(0, 2, 0x14))  # Clear RX status immediately
 
-    # --- CMAC update ---
-    # Check if last block
+    # --- CMAC update on ciphertext (before decryption) ---
     p.emit(addi(29, 0, 1))
     p.branch_bne(24, 29, "rx_cmac_nonfinal")
 
-    # CMAC finalize: XOR CT with K1
+    # Last block: CMAC finalize with K1
     load_abs(p, 28, CMAC_K1_ADDR)
     p.emit(lw(9, 28, 0));  p.emit(xor_r(10, 20, 9))
     p.emit(lw(9, 28, 4));  p.emit(xor_r(11, 21, 9))
@@ -497,43 +463,106 @@ def generate_firmware():
 
     p.label("rx_cmac_update_done")
 
-    # --- AES Decrypt ---
-    # Load CT into decryption engine
+    # --- AES Decrypt ciphertext -> plaintext in x20-x23 ---
     for i in range(4):
         p.emit(addi(IDX, 0, i))
         p.emit(aes_dec_load_ct(20+i, IDX))
-    # Load decryption key
     emit_load_dec_key(p, 6)
     p.emit(aes_dec_start())
     p.label("rx_dec_poll")
     p.emit(aes_dec_status(4))
     p.branch_beq(4, 0, "rx_dec_poll")
-    # Read plaintext -> x20-x23
     for i in range(4):
         p.emit(addi(IDX, 0, i))
         p.emit(aes_dec_read(20+i, IDX))
 
-    # --- Store plaintext in sector_buf ---
-    p.emit(slli(27, 26, 4))      # x27 = block * 16
-    p.emit(add(28, 3, 27))       # x28 = buf_base + offset
-    p.emit(sw(20, 28, 0))
-    p.emit(sw(21, 28, 4))
-    p.emit(sw(22, 28, 8))
-    p.emit(sw(23, 28, 12))
+    # --- Store plaintext directly into BRAM at x25 ---
+    p.emit(sw(20, 25, 0))
+    p.emit(sw(21, 25, 4))
+    p.emit(sw(22, 25, 8))
+    p.emit(sw(23, 25, 12))
+    p.emit(addi(25, 25, 16))   # advance BRAM write pointer
 
-    # Decrement remaining blocks
+    # Decrement block counter
     p.emit(addi(24, 24, -1))
+    p.branch_bne(24, 0, "rx_data_loop")
 
-    # Increment block within sector
-    p.emit(addi(26, 26, 1))
-    p.emit(addi(29, 0, 32))
+    # === All blocks received. Now wait for CMAC tag from TX ===
+    p.label("rx_wait_tag")
+    p.emit(lw(4, 2, 0))
+    p.emit(andi(4, 4, 1))
+    p.branch_beq(4, 0, "rx_wait_tag")
 
-    # Check if sector is full OR all blocks received
-    p.branch_beq(24, 0, "rx_write_final_sector")
-    p.branch_bne(26, 29, "rx_data_loop")
+    # Read received CMAC tag -> x20-x23
+    p.emit(lw(20, 2, 4))
+    p.emit(lw(21, 2, 8))
+    p.emit(lw(22, 2, 12))
+    p.emit(lw(23, 2, 16))
+    p.emit(sw(0, 2, 0x14))
 
-    # --- Write full sector to SD ---
-    p.emit(sw(25, 1, SD_SECTOR))
+    # --- Verify CMAC: x20-x23 (received) vs x16-x19 (computed) ---
+    p.emit(xor_r(4, 16, 20))
+    p.emit(xor_r(9, 17, 21))
+    p.emit(or_r(4, 4, 9))
+    p.emit(xor_r(9, 18, 22))
+    p.emit(or_r(4, 4, 9))
+    p.emit(xor_r(9, 19, 23))
+    p.emit(or_r(4, 4, 9))
+
+    p.branch_bne(4, 0, "rx_cmac_fail")
+
+    # =========================================================
+    # CMAC PASSED: Now write image from BRAM to SD card
+    # =========================================================
+    # Show 5 on display (writing to SD)
+    p.emit(addi(4, 0, 0x15))
+    p.emit(sw(4, 1, GPIO_OUT))
+
+    # Write metadata to SD sector 0:
+    # Reload image_size and total_blocks from BRAM META_ADDR
+    load_abs(p, 28, META_ADDR)
+    p.emit(lw(29, 28, 0))   # x29 = image_size
+    p.emit(lw(24, 28, 4))   # x24 = total_blocks
+    p.emit(lw(26, 28, 8))   # x26 = total_data_sectors
+
+    p.emit(sw(29, 3, 0))    # sector_buf[0] = image_size
+    p.emit(sw(24, 3, 4))    # sector_buf[4] = total_blocks
+    p.emit(sw(0, 3, 8))
+    p.emit(sw(0, 3, 12))
+    p.emit(sw(0, 1, SD_SECTOR))
+    p.emit(addi(4, 0, 8))
+    p.emit(sw(4, 1, SD_CTRL))
+    p.emit(addi(4, 0, 2))
+    p.emit(sw(4, 1, SD_CTRL))
+    p.label("rx_meta_wr_wait")
+    p.emit(lw(4, 1, SD_STATUS))
+    p.emit(andi(4, 4, 16))
+    p.branch_beq(4, 0, "rx_meta_wr_wait")
+
+    # === Write image sectors from BRAM to SD ===
+    # x25 = BRAM read pointer (start = IMAGE_BUF_ADDR)
+    # x26 = remaining sectors
+    # x27 = current SD sector number (start = 1)
+    load_abs(p, 25, IMAGE_BUF_ADDR)
+    p.emit(addi(27, 0, 1))
+
+    p.label("rx_sd_write_loop")
+
+    # Copy 512 bytes (128 words) from BRAM into SD sector_buf via MMIO
+    # x28 = MMIO sector_buf write pointer (= x3 = SD_BASE + BUF_OFFSET)
+    p.emit(add(28, 3, 0))   # x28 = x3 (sector_buf base)
+    p.emit(addi(31, 0, 128)) # x31 = word count
+    p.emit(addi(30, 0, 0))   # x30 = word index
+    p.label("rx_copy_loop")
+    p.emit(lw(4, 25, 0))     # read word from BRAM
+    p.emit(sw(4, 28, 0))     # write word to MMIO sector_buf
+    p.emit(addi(25, 25, 4))  # advance BRAM ptr
+    p.emit(addi(28, 28, 4))  # advance MMIO ptr
+    p.emit(addi(30, 30, 1))  # word_index++
+    p.branch_bne(30, 31, "rx_copy_loop")
+
+    # Write sector to SD
+    p.emit(sw(27, 1, SD_SECTOR))
     p.emit(addi(4, 0, 8))
     p.emit(sw(4, 1, SD_CTRL))
     p.emit(addi(4, 0, 2))
@@ -543,71 +572,20 @@ def generate_firmware():
     p.emit(andi(4, 4, 16))
     p.branch_beq(4, 0, "rx_wr_wait")
 
-    # Next sector, reset block counter
-    p.emit(addi(25, 25, 1))
-    p.emit(addi(26, 0, 0))
+    # Next sector
+    p.emit(addi(27, 27, 1))
+    p.emit(addi(26, 26, -1))
+    p.branch_bne(26, 0, "rx_sd_write_loop")
 
-    # Zero sector buffer for next sector
-    p.emit(addi(28, 0, 0))
-    p.label("rx_zero_buf2")
-    p.emit(add(29, 3, 28))
-    p.emit(sw(0, 29, 0))
-    p.emit(addi(28, 28, 4))
-    p.emit(addi(31, 0, 0x200))
-    p.branch_bne(28, 31, "rx_zero_buf2")
-
-    # Update display with progress
-    p.emit(addi(4, 0, 0x14))
-    p.emit(sw(4, 1, GPIO_OUT))
-
-    p.jump("rx_data_loop")
-
-    # --- Write final partial sector ---
-    p.label("rx_write_final_sector")
-    p.emit(sw(25, 1, SD_SECTOR))
-    p.emit(addi(4, 0, 8))
-    p.emit(sw(4, 1, SD_CTRL))
-    p.emit(addi(4, 0, 2))
-    p.emit(sw(4, 1, SD_CTRL))
-    p.label("rx_final_wr_wait")
-    p.emit(lw(4, 1, SD_STATUS))
-    p.emit(andi(4, 4, 16))
-    p.branch_beq(4, 0, "rx_final_wr_wait")
-
-    # --- Wait for CMAC tag ---
-    p.label("rx_wait_tag")
-    p.emit(lw(4, 2, 0))
-    p.emit(andi(4, 4, 1))
-    p.branch_beq(4, 0, "rx_wait_tag")
-
-    # Read tag -> x20-x23
-    p.emit(lw(20, 2, 4))
-    p.emit(lw(21, 2, 8))
-    p.emit(lw(22, 2, 12))
-    p.emit(lw(23, 2, 16))
-    p.emit(sw(0, 2, 0x14))
-
-    # --- Verify CMAC: compare x20-x23 with x16-x19 ---
-    p.emit(xor_r(4, 16, 20))
-    p.emit(xor_r(9, 17, 21))
-    p.emit(or_r(4, 4, 9))
-    p.emit(xor_r(9, 18, 22))
-    p.emit(or_r(4, 4, 9))
-    p.emit(xor_r(9, 19, 23))
-    p.emit(or_r(4, 4, 9))
-    # x4 = 0 if match
-
-    p.branch_bne(4, 0, "rx_cmac_fail")
-
-    # CMAC PASS
-    p.emit(addi(4, 0, 0x19))  # digit=9 (pass), LED[1] on
+    # === Done! Show 9 (pass) ===
+    p.emit(addi(4, 0, 0x19))  # digit=9, LED[1] on
     p.emit(sw(4, 1, GPIO_OUT))
     p.label("rx_done")
     p.jump("rx_done")
 
     p.label("rx_cmac_fail")
-    # CMAC FAIL
-    p.emit(addi(4, 0, 0x2E))  # digit=E (error), LED[2] on
+    # CMAC FAIL - show E on display
+    p.emit(addi(4, 0, 0x2E))  # digit=E, LED[2] on
     p.emit(sw(4, 1, GPIO_OUT))
     p.label("rx_fail_halt")
     p.jump("rx_fail_halt")
