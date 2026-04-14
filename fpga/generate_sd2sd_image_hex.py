@@ -311,6 +311,15 @@ def generate_firmware():
     p.emit(andi(4, 4, 8))              # bit3 = rd_done
     p.branch_beq(4, 0, "tx_sd_read_wait")
 
+    # === Wait ~15ms for RX to finish its SD write from previous sector ===
+    # SD card write + flash programming takes 5-10ms on the RX side.
+    # At 100MHz: 15ms = 1,500,000 cycles. Loop = 4 cycles/iter.
+    # 1,500,000 / 4 ≈ 375,000 ≈ 0x5B8D8. Use lui(30, 0x5C) = 0x5C000 = 376,832
+    p.emit(lui(30, 0x5C))
+    p.label("tx_sector_pace")
+    p.emit(addi(30, 30, -1))
+    p.branch_bne(30, 0, "tx_sector_pace")
+
     # Reset block-within-sector counter
     p.emit(addi(26, 0, 0))             # x26 = 0
 
