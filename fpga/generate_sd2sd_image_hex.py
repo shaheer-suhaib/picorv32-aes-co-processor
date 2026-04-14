@@ -234,6 +234,12 @@ def generate_firmware():
     load_abs(p, 14, MAC_KEY_ADDR)
     load_abs(p, 15, CMAC_HDR_ADDR)
 
+    # === Power-up delay (~100ms) for SD card to stabilize ===
+    p.emit(lui(4, 0x200))           # x4 = 0x200000 (~2M)
+    p.label("powerup_delay")
+    p.emit(addi(4, 4, -1))
+    p.branch_bne(4, 0, "powerup_delay")
+
     # === Wait for SD card initialization ===
     p.label("wait_sd_init")
     p.emit(lw(4, 1, SD_STATUS))
@@ -284,7 +290,10 @@ def generate_firmware():
     p.emit(addi(23, 0, 0))
     emit_send_raw(p, 20, 21, 22, 23)
     # Delay
-    for _ in range(10): p.emit(nop())
+    p.emit(addi(30, 0, 2000))
+    p.label("tx_header_delay")
+    p.emit(addi(30, 30, -1))
+    p.branch_bne(30, 0, "tx_header_delay")
 
     # Initialize CMAC
     emit_cmac_init(p)
@@ -352,8 +361,12 @@ def generate_firmware():
 
     # Send ciphertext via SPI
     emit_send_raw(p, 20, 21, 22, 23)
-    # Small delay between transfers
-    for _ in range(5): p.emit(nop())
+    # Robust delay between transfers to let RX board catch up
+    # RX needs ~500+ cycles for AES decrypt + CMAC update per block
+    p.emit(addi(30, 0, 2000))
+    p.label("tx_interblock_delay")
+    p.emit(addi(30, 30, -1))
+    p.branch_bne(30, 0, "tx_interblock_delay")
 
     # Decrement remaining blocks
     p.emit(addi(24, 24, -1))
