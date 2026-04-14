@@ -13,7 +13,9 @@ module ControlUnit_Enryption(
 		else
 			current <= next;
 	end
+	
 	always @(*) begin
+		// Default values for all outputs
 		done = 0;
 		init = 0;
 		en_round_out = 0;
@@ -23,12 +25,17 @@ module ControlUnit_Enryption(
 		en_reg_col_out = 0;
 		en_Dout = 0;
 		isRound0 = 0;
+		
+		// CRITICAL FIX: Default value for next to prevent latch
+		next = current;
+		
 		case (current)
 			S0: begin
 				if (encrypt) begin
 					init = 1;
 					next = S1;
 				end
+				// else: next remains current (S0) due to default assignment
 			end
 			S1: begin
 				isRound0 = 1;
@@ -61,15 +68,19 @@ module ControlUnit_Enryption(
 				end
 				else begin
 					en_Dout = 1;
-			      next = S6;
+					next = S6;
 				end
 			end
 			S6: begin
 				done = 1;
-			   if (encrypt) begin
-			      init = 1;
-				   next = S1;
-			   end
+				if (encrypt) begin
+					init = 1;
+					next = S1;
+				end
+				// else: next remains current (S6) due to default assignment
+			end
+			default: begin
+				next = S0;
 			end
 		endcase
 	end
