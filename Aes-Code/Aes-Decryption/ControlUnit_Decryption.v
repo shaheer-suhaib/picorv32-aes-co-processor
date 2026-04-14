@@ -33,6 +33,7 @@ module ControlUnit_Decryption(
 	end
 	
 	always @(*) begin
+		// Default values for all outputs
 		done = 0;
 		isRound10 = 0;
 		isRound9 = 0;
@@ -41,7 +42,12 @@ module ControlUnit_Decryption(
 		en_round_out = 0;
 		en_reg_inv_row_out = 0;
 		en_reg_inv_sub_out = 0;
+		en_reg_inv_col_out = 0;
 		en_Dout = 0;
+
+		// CRITICAL: Default value for next to prevent latch
+		next = current;
+
 		case (current)
 			S0: begin
 				if (decrypt) begin

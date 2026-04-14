@@ -160,12 +160,11 @@ module picorv32 #(
 	output reg        trace_valid,
 	output reg [35:0] trace_data,
 
-	// AES SPI Interface (only when ENABLE_AES is set)
-	output            aes_spi_mosi,
-	output            aes_spi_clk,
-	output            aes_spi_cs_n,
-	output            aes_spi_active,
-	input             aes_spi_miso
+	// AES SPI Interface - 8-lane parallel (only when ENABLE_AES is set)
+	output [7:0]      aes_spi_data,    // 8 parallel data lanes
+	output            aes_spi_clk,     // Byte strobe clock
+	output            aes_spi_cs_n,    // Chip select (active low)
+	output            aes_spi_active   // Transfer in progress
 );
 	localparam integer irq_timer = 0;
 	localparam integer irq_ebreak = 1;
@@ -353,18 +352,17 @@ module picorv32 #(
 			.pcpi_rd   (pcpi_aes_rd    ),
 			.pcpi_wait (pcpi_aes_wait  ),
 			.pcpi_ready(pcpi_aes_ready ),
-			.aes_spi_mosi (aes_spi_mosi),
-			.aes_spi_clk  (aes_spi_clk ),
-			.aes_spi_cs_n (aes_spi_cs_n),
-			.aes_spi_active (aes_spi_active),
-			.aes_spi_miso (aes_spi_miso)
+			.aes_spi_data   (aes_spi_data  ),
+			.aes_spi_clk    (aes_spi_clk   ),
+			.aes_spi_cs_n   (aes_spi_cs_n  ),
+			.aes_spi_active (aes_spi_active)
 		);
 	end else begin
 		assign pcpi_aes_wr = 0;
 		assign pcpi_aes_rd = 32'bx;
 		assign pcpi_aes_wait = 0;
 		assign pcpi_aes_ready = 0;
-		assign aes_spi_mosi = 1'b0;
+		assign aes_spi_data = 8'b0;
 		assign aes_spi_clk = 1'b0;
 		assign aes_spi_cs_n = 1'b1;
 		assign aes_spi_active = 1'b0;
@@ -3138,7 +3136,7 @@ endmodule
 
 
 /***************************************************************
- * pcpi_aes - AES Co-Processor for PicoRV32
+ * pcpi_aes - AES Co-Processor for PicoRV32 (FIXED VERSION)
  * 
  * Custom Instructions (opcode = 0001011, funct3 = 000):
  *   funct7=0100000: AES_LOAD_PT  - Load plaintext word  (rs1=index 0-3, rs2=data)
@@ -3146,9 +3144,6 @@ endmodule
  *   funct7=0100010: AES_START    - Start encryption     (no operands needed)
  *   funct7=0100011: AES_READ     - Read result word     (rs1=index 0-3) -> rd
  *   funct7=0100100: AES_STATUS   - Check status         () -> rd (1=done, 0=busy)
- ***************************************************************/
-/***************************************************************
- * pcpi_aes - Simplified AES Co-Processor with cleaner SPI
  ***************************************************************/
 module pcpi_aes #(
 	parameter integer AES_SPI_CLKS_PER_HALF_BIT = 2,
@@ -3164,12 +3159,11 @@ module pcpi_aes #(
 	output reg [31:0] pcpi_rd,
 	output reg        pcpi_wait,
 	output reg        pcpi_ready,
-	// SPI interface
-	input             aes_spi_miso,
-	output            aes_spi_mosi,
-	output            aes_spi_clk,
-	output            aes_spi_cs_n,
-	output            aes_spi_active
+	// 8-lane parallel SPI interface
+	output reg [7:0]  aes_spi_data,    // 8 parallel data lanes
+	output reg        aes_spi_clk,     // Byte strobe clock
+	output reg        aes_spi_cs_n,    // Chip select (active low)
+	output            aes_spi_active   // Transfer in progress
 );
 	// Instruction decode
 	wire [6:0] opcode = pcpi_insn[6:0];
@@ -3194,32 +3188,9 @@ module pcpi_aes #(
 	wire [127:0] Dout;
 	reg aes_local_reset;
 
-	// Simplified SPI control - just one flag and shift register
-	reg [127:0] spi_shift_reg;
-	reg [3:0] spi_byte_index;  // 0-15 for 16 bytes
+	// 8-lane parallel SPI control
+	reg [4:0] spi_byte_index;  // 0-15 (byte counter)
 	reg spi_active;
-	wire spi_tx_ready;
-
-	// SPI Master instance
-	SPI_Master_With_Single_CS #(
-		.CLKS_PER_HALF_BIT   (AES_SPI_CLKS_PER_HALF_BIT),
-		.MAX_BYTES_PER_CS    (AES_SPI_NUM_BYTES),
-		.CS_INACTIVE_CLKS    (AES_SPI_CS_INACTIVE_CLKS)
-	) aes_spi_master (
-		.i_Rst_L     (resetn),
-		.i_Clk       (clk),
-		.i_TX_Count  (AES_SPI_NUM_BYTES[4:0]),
-		.i_TX_Byte   (spi_shift_reg[7:0]),  // Always send LSB
-		.i_TX_DV     (spi_active && spi_tx_ready),
-		.o_TX_Ready  (spi_tx_ready),
-		.o_RX_Count  (),  // Unused - tie off
-		.o_RX_DV     (),  // Unused - tie off
-		.o_RX_Byte   (),  // Unused - tie off
-		.o_SPI_Clk   (aes_spi_clk),
-		.i_SPI_MISO  (aes_spi_miso),
-		.o_SPI_MOSI  (aes_spi_mosi),
-		.o_SPI_CS_n  (aes_spi_cs_n)
-	);
 
 	assign aes_spi_active = spi_active;
 
@@ -3235,12 +3206,15 @@ module pcpi_aes #(
 	);
 
 	// FSM states
-	localparam IDLE       = 3'd0;
-	localparam EXECUTE    = 3'd1;
-	localparam START_AES  = 3'd2;
-	localparam WAIT_AES   = 3'd3;
-	localparam COMPLETE   = 3'd4;
-	
+	localparam IDLE         = 3'd0;
+	localparam EXECUTE      = 3'd1;
+	localparam START_AES    = 3'd2;
+	localparam WAIT_AES     = 3'd3;
+	localparam SPI_CS_SETUP = 3'd4;  // CS setup time before first clock
+	localparam SPI_SEND     = 3'd5;
+	localparam SPI_CLK_LOW  = 3'd6;
+	localparam COMPLETE     = 3'd7;
+
 	reg [2:0] state;
 	reg [1:0] word_index;
 
@@ -3257,25 +3231,17 @@ module pcpi_aes #(
 			aes_running     <= 0;
 			aes_encrypt     <= 0;
 			aes_local_reset <= 0;
-			spi_shift_reg   <= 0;
 			spi_byte_index  <= 0;
 			spi_active      <= 0;
+			aes_spi_data    <= 8'b0;
+			aes_spi_clk     <= 0;
+			aes_spi_cs_n    <= 1;  // Inactive high
 		end else begin
 			// Clear single-cycle signals
 			pcpi_wr         <= 0;
 			pcpi_ready      <= 0;
 			aes_encrypt     <= 0;
 			aes_local_reset <= 0;
-
-			// Simplified SPI transmission: shift out byte by byte when active
-			if (spi_active && spi_tx_ready) begin
-				if (spi_byte_index < 15) begin
-					spi_shift_reg  <= spi_shift_reg >> 8;  // Shift for next byte
-					spi_byte_index <= spi_byte_index + 1'b1;
-				end else begin
-					spi_active <= 0;  // Done after 16 bytes
-				end
-			end
 
 			case (state)
 			IDLE: begin
@@ -3315,9 +3281,9 @@ module pcpi_aes #(
 					state      <= IDLE;
 				end
 				else if (instr_start) begin
-					aes_running <= 1;
-					state       <= START_AES;
-					aes_local_reset <= 1;
+					aes_running     <= 1;
+					aes_local_reset <= 1;  // Reset AES core
+					state           <= START_AES;
 				end
 				else if (instr_read) begin
 					case (word_index)
@@ -3341,6 +3307,7 @@ module pcpi_aes #(
 			end
 
 			START_AES: begin
+				// AES local reset was asserted previous cycle, now deassert and start
 				aes_encrypt <= 1;
 				state       <= WAIT_AES;
 			end
@@ -3348,35 +3315,60 @@ module pcpi_aes #(
 			WAIT_AES: begin
 				if (aes_done) begin
 					RESULT         <= Dout;
-					spi_shift_reg  <= Dout;       // Load encrypted data
 					spi_byte_index <= 0;
-					spi_active     <= 1;          // Start SPI transmission
+					spi_active     <= 1;          // Mark SPI as active
+					aes_spi_cs_n   <= 0;          // Assert chip select (active low)
 					aes_running    <= 0;
-					pcpi_rd        <= 32'd0;
-					pcpi_wr        <= 1;
-					pcpi_ready     <= 1;
-					pcpi_wait      <= 0;
-					state          <= COMPLETE;
+					state          <= SPI_CS_SETUP;  // CS setup time
+				end
+			end
+
+			SPI_CS_SETUP: begin
+				// CS has been low for one cycle, now output first byte with clock
+				aes_spi_data <= RESULT[7:0];  // First byte (LSB)
+				aes_spi_clk  <= 1;            // Strobe high
+				state        <= SPI_CLK_LOW;
+			end
+
+			SPI_SEND: begin
+				// 8-lane parallel SPI: output one byte per clock pulse
+				// Data is directly muxed from RESULT register
+				aes_spi_data <= RESULT[(spi_byte_index*8) +: 8];
+				aes_spi_clk  <= 1;  // Strobe high
+				state        <= SPI_CLK_LOW;
+			end
+
+			SPI_CLK_LOW: begin
+				// Complete the clock cycle by bringing clock low
+				aes_spi_clk <= 0;
+				if (spi_byte_index < 15) begin
+					spi_byte_index <= spi_byte_index + 1'b1;
+					state          <= SPI_SEND;
+				end else begin
+					// All 16 bytes sent
+					spi_active   <= 0;
+					aes_spi_cs_n <= 1;  // Deassert chip select
+					state        <= COMPLETE;
 				end
 			end
 
 			COMPLETE: begin
-				state <= IDLE;
+				// Signal PCPI completion
+				pcpi_rd    <= 32'd0;
+				pcpi_wr    <= 1;
+				pcpi_ready <= 1;
+				pcpi_wait  <= 0;
+				state      <= IDLE;
 			end
+
+			default: state <= IDLE;
 			endcase
 		end
 	end
 endmodule
-/***************************************************************
- * pcpi_aes_dec - AES Decryption Co-Processor for PicoRV32
- *
- * Custom Instructions (opcode = 0001011, funct3 = 000):
- *   funct7=0101000: AES_DEC_LOAD_CT  - Load ciphertext word  (rs1=index 0-3, rs2=data)
- *   funct7=0101001: AES_DEC_LOAD_KEY - Load key word         (rs1=index 0-3, rs2=data)
- *   funct7=0101010: AES_DEC_START    - Start decryption      (no operands needed)
- *   funct7=0101011: AES_DEC_READ     - Read result word      (rs1=index 0-3) -> rd
- *   funct7=0101100: AES_DEC_STATUS   - Check status          () -> rd (1=done, 0=busy)
- ***************************************************************/
+
+
+
 module pcpi_aes_dec (
 	input clk, resetn,
 	input             pcpi_valid,
